@@ -1,0 +1,109 @@
+STUDIO ONE PROJECT TOOLS V2 - PROMO / ПРОМО
+Beta Stable RC1
+
+RU
+Studio One Project Tools v2 - это инструмент для безопасной чистки, консолидации, восстановления и диагностики проектов Studio One / Fender Studio Pro.
+
+ГЛАВНАЯ ИДЕЯ
+Программа создаёт чистую автономную копию проекта, не ломая оригинальный .song. На выходе получается аккуратная папка проекта с нужными аудиофайлами, восстановленными missing files, отдельной чистой .song копией и отчётами.
+
+САМЫЙ СИЛЬНЫЙ ФУНКЦИОНАЛ
+- Чистая автономная копия проекта при консолидации.
+- Автоматический мгновенный поиск missing audio по всем подключённым носителям через bundled es.exe / Everything.
+- Восстановление найденных missing files в новую relinked .song копию.
+- Удаление / исключение bypassed FX через отдельную безопасную .song копию.
+- Поиск и разбор плагинов по трекам и FX-слотам.
+- Обнаружение unused файлов рядом с проектом.
+- Обнаружение duplicate / side files и вынесение их в отдельные папки.
+- Batch consolidate для массовой подготовки нескольких проектов.
+- Crash Analyzer без WinDbg/cdb: анализ minidump, stack memory, score/rank evidence.
+
+ЧТО ПРОГРАММА УМЕЕТ УБИРАТЬ И ЧИСТИТЬ
+- bypassed plugins / bypassed FX;
+- unused audio files рядом с проектом;
+- duplicate side files;
+- мусорные и лишние файлы, которые не нужны для автономной копии;
+- хаос из разбросанных missing audio ссылок;
+- зависимость проекта от старых внешних дисков и случайных путей.
+
+КОНСОЛИДАЦИЯ
+При консолидации создаётся новая проектная папка, куда собираются нужные аудиофайлы. Missing files могут быть автоматически найдены по всем подключённым дискам и носителям через Everything. После этого создаётся новая relinked .song копия, где проект уже смотрит на восстановленные файлы.
+
+ПЛАГИНЫ
+Программа показывает плагины по трекам и FX-слотам, помогает увидеть bypassed FX и создать отдельную .song копию без отключённых плагинов. Оригинальный проект при этом не перезаписывается.
+
+AUDIO / FILES
+Программа анализирует аудиофайлы проекта и показывает:
+- referenced files;
+- missing files;
+- duplicate candidates;
+- unused files;
+- side files рядом с проектом.
+
+CRASH ANALYZER
+Встроенный Crash Analyzer работает без WinDbg и cdb. Он читает minidump, анализирует stack memory и помогает понять, что вероятнее всего участвовало в падении: конкретный FX из проекта, audio driver, licensing DLL, host module, graphics DLL или другой non-system модуль. Самые важные строки подсвечиваются по score/rank.
+
+ДЛЯ КОГО
+- продюсеры;
+- звукорежиссёры;
+- инженеры сведения;
+- пользователи Studio One / Fender Studio Pro;
+- те, кто переносит проекты между дисками и компьютерами;
+- те, кто сталкивается с missing files, дублями, bypassed FX, мусором в папках и непонятными крашами.
+
+КЛЮЧЕВОЕ ПРЕИМУЩЕСТВО
+Studio One Project Tools v2 не просто показывает проблемы. Он помогает собрать проект в чистое, переносимое, безопасное состояние: найти потерянные файлы, убрать лишнее, подготовить автономную копию и диагностировать падения.
+
+
+EN
+Studio One Project Tools v2 is a safe cleanup, consolidation, recovery and diagnostics utility for Studio One / Fender Studio Pro projects.
+
+CORE IDEA
+The app creates a clean autonomous copy of the project without damaging the original .song file. The result is a clean project folder with required audio files, recovered missing files, a separate clean .song copy and reports.
+
+STRONGEST FEATURES
+- Clean autonomous project copy during consolidation.
+- Automatic instant missing audio search across all connected drives through bundled es.exe / Everything.
+- Recovery of found missing files into a new relinked .song copy.
+- Removal / exclusion of bypassed FX through a separate safe .song copy.
+- Plugin scanning by tracks and FX slots.
+- Detection of unused files near the project.
+- Detection of duplicate / side files and moving them into separate folders.
+- Batch consolidate for preparing multiple projects.
+- Crash Analyzer without WinDbg/cdb: minidump analysis, stack memory scan, score/rank evidence.
+
+WHAT THE TOOL CAN CLEAN OR REMOVE
+- bypassed plugins / bypassed FX;
+- unused audio files near the project;
+- duplicate side files;
+- unnecessary files that are not needed for the autonomous project copy;
+- scattered missing audio references;
+- dependency on old external drives and random file paths.
+
+CONSOLIDATION
+During consolidation, the tool creates a new project folder and collects the required audio files into it. Missing files can be found automatically across all connected drives and storage devices through Everything. Then the tool creates a new relinked .song copy where the project points to the recovered files.
+
+PLUGINS
+The app shows plugins by tracks and FX slots, helps detect bypassed FX and can create a separate .song copy without disabled plugins. The original project is not overwritten.
+
+AUDIO / FILES
+The app analyzes project audio files and shows:
+- referenced files;
+- missing files;
+- duplicate candidates;
+- unused files;
+- side files located near the project.
+
+CRASH ANALYZER
+The built-in Crash Analyzer works without WinDbg or cdb. It reads minidumps, scans stack memory and helps identify what was most likely involved in the crash: a project FX, audio driver, licensing DLL, host module, graphics DLL or another non-system module. The strongest evidence lines are highlighted by score/rank.
+
+TARGET USERS
+- producers;
+- recording engineers;
+- mixing engineers;
+- Studio One / Fender Studio Pro users;
+- users moving projects between drives and computers;
+- users dealing with missing files, duplicates, bypassed FX, messy project folders and unclear crashes.
+
+KEY ADVANTAGE
+Studio One Project Tools v2 does not just show project problems. It helps turn the project into a clean, portable and safer state: find lost files, remove unnecessary content, prepare an autonomous copy and diagnose crashes.

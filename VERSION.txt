@@ -1,0 +1,2 @@
+Studio One Project Tools v2 - Beta Stable RC1
+Build base: Everything neutral test + Crash Analyzer v2.8
