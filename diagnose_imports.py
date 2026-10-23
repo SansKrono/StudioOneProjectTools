@@ -1,15 +1,21 @@
+"""Import every app module and report which ones fail. Writes diagnose_imports_log.txt."""
+
 from pathlib import Path
 import traceback
 
 modules = [
+    "core.common",
     "core.song_archive",
+    "core.relink",
     "core.plugin_manager",
     "core.audio_manager",
+    "core.everything",
+    "core.missing_files",
     "core.consolidate",
     "core.report_generator",
-    "core.missing_files",
-    "core.everything",
     "core.settings_manager",
+    "core.minidump_reader",
+    "core.crash_analyzer",
     "gui.app",
 ]
 
@@ -26,7 +32,7 @@ for m in modules:
         log.append(traceback.format_exc())
 
 text = "\n".join(log)
-Path("diagnose_imports_log.txt").write_text(text, encoding="utf-8")
+Path(__file__).resolve().with_name("diagnose_imports_log.txt").write_text(text, encoding="utf-8")
 print(text)
 
 if not ok:

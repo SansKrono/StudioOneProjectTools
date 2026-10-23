@@ -15,9 +15,30 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Installing/updating PyInstaller...
-python -m pip install --upgrade pip
-python -m pip install --upgrade pyinstaller
+echo Creating build virtual environment in .venv-build ...
+if not exist ".venv-build\Scripts\python.exe" python -m venv .venv-build
+if errorlevel 1 (
+    echo ERROR: Could not create the virtual environment.
+    pause
+    exit /b 1
+)
+
+echo Installing build requirements...
+".venv-build\Scripts\python.exe" -m pip install -r requirements.txt
+if errorlevel 1 (
+    echo ERROR: Could not install build requirements.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Running tests...
+".venv-build\Scripts\python.exe" -m unittest discover -s tests
+if errorlevel 1 (
+    echo ERROR: Tests failed. Not building.
+    pause
+    exit /b 1
+)
 
 echo.
 echo Cleaning old build folders...
@@ -26,7 +47,7 @@ if exist dist rmdir /s /q dist
 
 echo.
 echo Building EXE...
-python -m PyInstaller --noconfirm --clean StudioOneProjectTools.spec
+".venv-build\Scripts\python.exe" -m PyInstaller --noconfirm --clean StudioOneProjectTools.spec
 if errorlevel 1 (
     echo.
     echo ERROR: Build failed.
@@ -39,8 +60,9 @@ echo Build complete.
 echo EXE folder:
 echo %CD%\dist\StudioOneProjectTools
 echo.
-echo IMPORTANT:
-echo Keep es.exe next to StudioOneProjectTools.exe.
-echo The app uses bundled es.exe automatically.
-echo.
+if not exist es.exe (
+    echo NOTE: es.exe was not bundled. Missing-file search will use es.exe from
+    echo PATH or Program Files\Everything, or the path set in Settings.
+    echo.
+)
 pause

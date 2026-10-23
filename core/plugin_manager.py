@@ -1,14 +1,33 @@
 from pathlib import Path
 import re
-from .song_archive import read_text_from_archive, write_modified_song_copy
+
+from core.song_archive import read_text_from_archive, replace_member_text
 from models.plugin import PluginItem
 
 
 AUDIO_MIXER_XML = "Devices/audiomixer.xml"
 
+NO_TRACK_NAME = "(no track name)"
+
+# Studio One mixer channel elements that can contain FX inserts, e.g.
+#   <AudioTrackChannel ... name="Channel20" label="Guitar DI">
+CHANNEL_TAGS = (
+    "AudioTrackChannel",
+    "AudioOutputChannel",
+    "AudioInputChannel",
+    "BusChannel",
+    "FolderChannel",
+    "VCAChannel",
+    "FXChannel",
+    "InstrumentChannel",
+)
+
+_CHANNEL_TAG_RE = re.compile(r"<(/?)(" + "|".join(CHANNEL_TAGS) + r")\b([^>]*)>", re.IGNORECASE)
+_BYPASS_ATTR_RE = re.compile(r'\bbypass="[^"]*"')
+
 
 def extract_attr(tag: str, attr: str) -> str:
-    m = re.search(rf'{re.escape(attr)}="([^"]*)"', tag)
+    m = re.search(rf'\b{re.escape(attr)}="([^"]*)"', tag)
     return m.group(1) if m else ""
 
 
@@ -28,8 +47,10 @@ def find_matching_attributes_end(text: str, start: int) -> int:
             tag_end = text.find(">", next_open)
             if tag_end == -1:
                 raise ValueError("Broken <Attributes> tag")
-            if tag_end > next_open and text[tag_end - 1] == "/":
+            if text[tag_end - 1] == "/":
                 depth -= 1
+                if depth == 0:
+                    return tag_end + 1
             pos = tag_end + 1
         else:
             depth -= 1
@@ -53,59 +74,36 @@ def get_plugin_name_from_block(block: str) -> str:
     return "UNKNOWN"
 
 
-def find_parent_channel_name(text: str, fx_start: int) -> str:
+class _ChannelTracker:
     """
-    Best-effort parent channel detection for Studio One audiomixer.xml.
-    FX blocks are usually inside tags like:
-      <AudioTrackChannel ... name="Channel20" label="Guitar DI">
-      <AudioOutputChannel ... label="Main">
-      <BusChannel ... label="Bus 1">
+    Tracks which mixer channel encloses a given offset.
+
+    Offsets must be queried in increasing order; each channel tag is visited once,
+    so the whole document is scanned in a single pass.
     """
-    prefix = text[:fx_start]
 
-    channel_tags = [
-        "AudioTrackChannel",
-        "AudioOutputChannel",
-        "AudioInputChannel",
-        "BusChannel",
-        "FolderChannel",
-        "VCAChannel",
-        "FXChannel",
-        "InstrumentChannel",
-    ]
+    def __init__(self, text: str):
+        self._tags = _CHANNEL_TAG_RE.finditer(text)
+        self._pending = next(self._tags, None)
+        self._stack: list[str] = []
 
-    tag_pattern = re.compile(
-        r'<(/?)(' + "|".join(channel_tags) + r')\b([^>]*)>',
-        flags=re.IGNORECASE,
-    )
-
-    stack = []
-
-    for match in tag_pattern.finditer(prefix):
-        is_closing = match.group(1) == "/"
-        tag_name = match.group(2)
-        attrs = match.group(3) or ""
-        full_tag = match.group(0)
-        self_closing = full_tag.rstrip().endswith("/>")
-
-        if is_closing:
-            if stack:
-                stack.pop()
-            continue
-
-        label = extract_attr(attrs, "label")
-        name = extract_attr(attrs, "name")
-        display = label or name or tag_name
-
-        if not self_closing:
-            stack.append(display)
-
-    return stack[-1] if stack else "(no track name)"
+    def channel_at(self, offset: int) -> str:
+        while self._pending and self._pending.end() <= offset:
+            m = self._pending
+            if m.group(1) == "/":
+                if self._stack:
+                    self._stack.pop()
+            elif not m.group(0).rstrip().endswith("/>"):
+                attrs = m.group(3) or ""
+                self._stack.append(extract_attr(attrs, "label") or extract_attr(attrs, "name") or m.group(2))
+            self._pending = next(self._tags, None)
+        return self._stack[-1] if self._stack else NO_TRACK_NAME
 
 
 def parse_fx_blocks(audiomixer_xml: str) -> list[dict]:
     fx = []
     pos = 0
+    channels = _ChannelTracker(audiomixer_xml)
 
     while True:
         start = audiomixer_xml.find('<Attributes name="FX', pos)
@@ -124,19 +122,21 @@ def parse_fx_blocks(audiomixer_xml: str) -> list[dict]:
             break
 
         block = audiomixer_xml[start:end]
+        if block.endswith("/>") and block.count("<") == 1:
+            # Empty self-closing slot such as <Attributes name="FX3"/>: no plugin inside.
+            pos = end
+            continue
+
         slot = extract_attr(start_tag, "name")
-        bypass = extract_attr(start_tag, "bypass") == "1"
-        plugin_name = get_plugin_name_from_block(block)
-        channel_name = find_parent_channel_name(audiomixer_xml, start)
-        path = f"{channel_name} / {slot}" if channel_name else slot
+        channel_name = channels.channel_at(start)
 
         fx.append(
             {
                 "slot": slot,
                 "channel": channel_name,
-                "path": path,
-                "plugin": plugin_name,
-                "bypass": bypass,
+                "path": f"{channel_name} / {slot}",
+                "plugin": get_plugin_name_from_block(block),
+                "bypass": extract_attr(start_tag, "bypass") == "1",
                 "start": start,
                 "end": end,
                 "block": block,
@@ -150,23 +150,36 @@ def parse_fx_blocks(audiomixer_xml: str) -> list[dict]:
 
 def parse_plugins(song_path: Path) -> list[PluginItem]:
     xml = read_text_from_archive(song_path, AUDIO_MIXER_XML)
-    fx_blocks = parse_fx_blocks(xml)
 
     return [
         PluginItem(
             index=i,
-            track_name=fx.get("channel") or "(no track name)",
-            slot_name=fx.get("slot") or "FX",
-            plugin_name=fx.get("plugin") or "UNKNOWN",
-            bypassed=bool(fx.get("bypass")),
+            track_name=fx["channel"] or NO_TRACK_NAME,
+            slot_name=fx["slot"] or "FX",
+            plugin_name=fx["plugin"] or "UNKNOWN",
+            bypassed=fx["bypass"],
             xml_file=AUDIO_MIXER_XML,
         )
-        for i, fx in enumerate(fx_blocks)
+        for i, fx in enumerate(parse_fx_blocks(xml))
     ]
 
 
-def count_bypassed_fx(song_path: Path) -> int:
-    return sum(1 for p in parse_plugins(song_path) if p.bypassed)
+def _set_bypass(block: str, bypassed: bool) -> str:
+    tag_end = block.find(">")
+    if tag_end == -1:
+        return block
+
+    tag, rest = block[:tag_end + 1], block[tag_end + 1:]
+    value = "1" if bypassed else "0"
+
+    if _BYPASS_ATTR_RE.search(tag):
+        tag = _BYPASS_ATTR_RE.sub(f'bypass="{value}"', tag, count=1)
+    elif tag.endswith("/>"):
+        tag = tag[:-2].rstrip() + f' bypass="{value}"/>'
+    else:
+        tag = tag[:-1] + f' bypass="{value}">'
+
+    return tag + rest
 
 
 def modify_fx_xml_by_indices(audiomixer_xml: str, selected_indices: set[int], action: str) -> tuple[str, list[str]]:
@@ -176,10 +189,10 @@ def modify_fx_xml_by_indices(audiomixer_xml: str, selected_indices: set[int], ac
       - bypass: set bypass="1"
       - unbypass: set bypass="0"
     """
-    fx_blocks = parse_fx_blocks(audiomixer_xml)
-    if not fx_blocks:
-        return audiomixer_xml, []
+    if action not in {"remove", "bypass", "unbypass"}:
+        raise ValueError(f"Unknown FX action: {action}")
 
+    fx_blocks = parse_fx_blocks(audiomixer_xml)
     changed = []
     out = []
     pos = 0
@@ -189,30 +202,8 @@ def modify_fx_xml_by_indices(audiomixer_xml: str, selected_indices: set[int], ac
 
         if index in selected_indices:
             changed.append(fx["plugin"])
-
-            if action == "remove":
-                # Drop whole FX block.
-                pass
-
-            elif action in {"bypass", "unbypass"}:
-                new_block = fx["block"]
-                tag_end = new_block.find(">")
-
-                if tag_end == -1:
-                    out.append(new_block)
-                else:
-                    tag = new_block[:tag_end + 1]
-                    rest = new_block[tag_end + 1:]
-                    new_value = "1" if action == "bypass" else "0"
-
-                    if re.search(r'\bbypass="[^"]*"', tag):
-                        tag = re.sub(r'\bbypass="[^"]*"', f'bypass="{new_value}"', tag, count=1)
-                    else:
-                        tag = tag[:-1] + f' bypass="{new_value}">'
-
-                    out.append(tag + rest)
-            else:
-                out.append(fx["block"])
+            if action != "remove":
+                out.append(_set_bypass(fx["block"], action == "bypass"))
         else:
             out.append(fx["block"])
 
@@ -224,25 +215,12 @@ def modify_fx_xml_by_indices(audiomixer_xml: str, selected_indices: set[int], ac
 
 def remove_bypassed_fx(song_path: Path, output_path: Path) -> Path:
     xml = read_text_from_archive(song_path, AUDIO_MIXER_XML)
-    fx_blocks = parse_fx_blocks(xml)
-    selected = {i for i, fx in enumerate(fx_blocks) if fx.get("bypass")}
+    selected = {i for i, fx in enumerate(parse_fx_blocks(xml)) if fx["bypass"]}
     new_xml, _ = modify_fx_xml_by_indices(xml, selected, "remove")
-
-    return write_modified_song_copy(
-        song_path=song_path,
-        output_path=output_path,
-        replacements={AUDIO_MIXER_XML: new_xml},
-    )
+    return replace_member_text(song_path, output_path, {AUDIO_MIXER_XML: new_xml})
 
 
 def modify_selected_fx(song_path: Path, output_path: Path, selected_indices: set[int], action: str) -> tuple[Path, list[str]]:
     xml = read_text_from_archive(song_path, AUDIO_MIXER_XML)
     new_xml, changed = modify_fx_xml_by_indices(xml, selected_indices, action)
-
-    result = write_modified_song_copy(
-        song_path=song_path,
-        output_path=output_path,
-        replacements={AUDIO_MIXER_XML: new_xml},
-    )
-
-    return result, changed
+    return replace_member_text(song_path, output_path, {AUDIO_MIXER_XML: new_xml}), changed

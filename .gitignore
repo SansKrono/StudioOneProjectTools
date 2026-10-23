@@ -32,3 +32,12 @@ Thumbs.db
 # Optional third-party binary
 es.exe
 bin/es.exe
+
+# Logs written next to the app
+batch_error_log.txt
+startup_error_log.txt
+diagnose_imports_log.txt
+
+# Build environment and release folders
+.venv-build/
+StudioOneProjectTools_v2_*_Windows/

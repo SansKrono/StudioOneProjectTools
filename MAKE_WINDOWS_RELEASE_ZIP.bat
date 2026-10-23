@@ -8,18 +8,25 @@ if not exist "dist\StudioOneProjectTools\StudioOneProjectTools.exe" (
     exit /b 1
 )
 
-set RELEASE=StudioOneProjectTools_v2_Beta_Stable_RC1_Windows
+set RELEASE=StudioOneProjectTools_v2_Beta_Stable_RC2_Windows
 if exist "%RELEASE%" rmdir /s /q "%RELEASE%"
+if exist "%RELEASE%.zip" del "%RELEASE%.zip"
 mkdir "%RELEASE%"
 
-xcopy "dist\StudioOneProjectTools" "%RELEASE%\StudioOneProjectTools" /E /I /Y
-copy "MANUAL_RU_EN.docx" "%RELEASE%\" >nul
-copy "MANUAL_RU_EN.pdf" "%RELEASE%\" >nul
-copy "PROMO_RU_EN.txt" "%RELEASE%\" >nul
-copy "WINDOWS_BUILD_README_RU_EN.md" "%RELEASE%\" >nul
+xcopy "dist\StudioOneProjectTools" "%RELEASE%\StudioOneProjectTools" /E /I /Y >nul
+copy "docs\MANUAL.md" "%RELEASE%\" >nul
+copy "README.md" "%RELEASE%\" >nul
+copy "LICENSE" "%RELEASE%\" >nul
+copy "WINDOWS_BUILD.md" "%RELEASE%\" >nul
 copy "VERSION.txt" "%RELEASE%\StudioOneProjectTools\" >nul
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%RELEASE%' -DestinationPath '%RELEASE%.zip' -Force"
+rem tar.exe ships with Windows 10 1803+ and can write .zip archives.
+tar -a -c -f "%RELEASE%.zip" "%RELEASE%"
+if errorlevel 1 (
+    echo ERROR: Could not create the ZIP archive.
+    pause
+    exit /b 1
+)
 
 echo.
 echo Release package created:

@@ -2,6 +2,8 @@ from pathlib import Path
 import hashlib
 import os
 import re
+
+from core.common import filename_from_reference, format_bytes
 from models.audio_file import AudioFileItem
 
 
@@ -9,30 +11,25 @@ AUDIO_EXTENSIONS = {
     ".wav", ".wave", ".aif", ".aiff", ".flac", ".mp3", ".ogg", ".m4a", ".wma"
 }
 
+# Longest first plus a trailing boundary, so "beat.aiff" is not cut to "beat.aif".
+_EXT_ALTERNATION = "|".join(sorted((e.lstrip(".") for e in AUDIO_EXTENSIONS), key=len, reverse=True))
 
+# An absolute Windows path (C:\...\file.wav), or a relative backslash path / bare
+# file name (Media\file.wav, file.wav). Forward-slash paths and URLs are reduced to
+# their file name and resolved by name inside the project.
 AUDIO_REF_PATTERN = re.compile(
-    r'([A-Za-z]:\\[^"<>\n\r]+?\.(?:wav|wave|aif|aiff|flac|mp3|ogg|m4a|wma)|[^"<>\n\r/\\]+?\.(?:wav|wave|aif|aiff|flac|mp3|ogg|m4a|wma))',
+    rf'([A-Za-z]:\\[^"<>\n\r]+?\.(?:{_EXT_ALTERNATION})|[^"<>\n\r/:]+?\.(?:{_EXT_ALTERNATION}))(?![A-Za-z0-9])',
     re.IGNORECASE,
 )
 
-
-def format_size(size: int | None) -> str:
-    if size is None:
-        return ""
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(size)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            if unit == "B":
-                return f"{int(value)} {unit}"
-            return f"{value:.2f} {unit}"
-        value /= 1024
-    return str(size)
+# Kept for backwards compatibility with older callers.
+format_size = format_bytes
 
 
 def quick_audio_fingerprint(path: Path, edge_bytes: int = 1024 * 1024) -> tuple[int, str]:
+    """Size plus an MD5 of the first and last MB. Used only to compare files, not for security."""
     size = path.stat().st_size
-    h = hashlib.md5()
+    h = hashlib.md5(usedforsecurity=False)
     h.update(str(size).encode("ascii"))
 
     with path.open("rb") as f:
@@ -46,9 +43,10 @@ def quick_audio_fingerprint(path: Path, edge_bytes: int = 1024 * 1024) -> tuple[
 
 def list_project_audio_files(project_dir: Path) -> list[Path]:
     files = []
-    for p in project_dir.rglob("*"):
-        if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS:
-            files.append(p)
+    for root, _dirs, names in os.walk(project_dir):
+        for name in names:
+            if os.path.splitext(name)[1].lower() in AUDIO_EXTENSIONS:
+                files.append(Path(root, name))
     return files
 
 
@@ -64,28 +62,34 @@ def extract_audio_references_from_text(text: str) -> list[str]:
     return refs
 
 
-def resolve_audio_reference(ref: str, project_dir: Path) -> Path | None:
+def _index_by_name(files: list[Path]) -> dict[str, Path]:
+    index: dict[str, Path] = {}
+    for p in files:
+        index.setdefault(p.name.lower(), p)
+    return index
+
+
+def _resolve(ref: str, project_dir: Path, name_index: dict[str, Path]) -> tuple[Path | None, bool]:
+    """Return (path, resolved_by_name_only)."""
     p = Path(ref)
 
     if p.is_absolute() and p.exists():
-        return p
+        return p, False
 
-    candidate = project_dir / ref
-    if candidate.exists():
-        return candidate
-
-    # Windows paths inside XML can contain backslashes even if Path is running normally.
+    # Windows paths inside XML use backslashes even on other platforms.
     candidate = project_dir / ref.replace("\\", os.sep)
     if candidate.exists():
-        return candidate
+        return candidate, False
 
-    name = Path(ref.replace("\\", "/")).name
-    if name:
-        for found in project_dir.rglob(name):
-            if found.is_file():
-                return found
+    name = filename_from_reference(ref)
+    found = name_index.get(name.lower()) if name else None
+    return found, found is not None
 
-    return None
+
+def resolve_audio_reference(ref: str, project_dir: Path, name_index: dict[str, Path] | None = None) -> Path | None:
+    if name_index is None:
+        name_index = _index_by_name(list_project_audio_files(project_dir))
+    return _resolve(ref, project_dir, name_index)[0]
 
 
 def detect_duplicate_audio(files: list[Path]) -> dict[str, list[Path]]:
@@ -109,56 +113,46 @@ def detect_duplicate_audio(files: list[Path]) -> dict[str, list[Path]]:
             except OSError:
                 continue
 
-            key = f"{size}:{digest}"
-            groups.setdefault(key, []).append(p)
+            groups.setdefault(f"{size}:{digest}", []).append(p)
 
     return {k: v for k, v in groups.items() if len(v) > 1}
 
 
+def _file_size(p: Path) -> int | None:
+    try:
+        return p.stat().st_size
+    except OSError:
+        return None
+
+
 def build_audio_table_rows(project_dir: Path, archive_texts: list[str]) -> list[AudioFileItem]:
-    all_text = "\n".join(archive_texts)
-    refs = extract_audio_references_from_text(all_text)
+    project_root = project_dir.resolve()
+    local_files = list_project_audio_files(project_dir)
+    name_index = _index_by_name(local_files)
+
+    refs = extract_audio_references_from_text("\n".join(archive_texts))
 
     rows: list[AudioFileItem] = []
-    used_paths: set[Path] = set()
+    resolved_of: dict[int, Path] = {}
     used_names: set[str] = set()
 
     for ref in refs:
-        resolved = resolve_audio_reference(ref, project_dir)
-        filename = Path(ref.replace("\\", "/")).name
+        resolved, by_name = _resolve(ref, project_dir, name_index)
+        filename = filename_from_reference(ref)
 
         if resolved:
-            try:
-                size = resolved.stat().st_size
-            except OSError:
-                size = None
-
-            status = "NORMAL"
-            try:
-                if resolved.is_absolute() and not resolved.resolve().is_relative_to(project_dir.resolve()):
-                    status = "EXTERNAL"
-            except Exception:
-                pass
-
-            rows.append(AudioFileItem(status, size, str(resolved.parent), resolved.name, resolved, ref))
-            used_paths.add(resolved.resolve())
+            rp = resolved.resolve()
+            status = "NORMAL" if (not resolved.is_absolute() or rp.is_relative_to(project_root)) else "EXTERNAL"
+            row = AudioFileItem(status, _file_size(resolved), str(resolved.parent), resolved.name, resolved, ref,
+                                resolved_by_name=by_name)
+            resolved_of[id(row)] = rp
             used_names.add(resolved.name.lower())
         else:
-            rows.append(AudioFileItem("MISSING", None, "", filename, None, ref))
+            row = AudioFileItem("MISSING", None, "", filename, None, ref)
             used_names.add(filename.lower())
+        rows.append(row)
 
-    local_files = list_project_audio_files(project_dir)
-    duplicate_groups = detect_duplicate_audio(local_files)
-    duplicate_paths: set[Path] = set()
-    duplicate_key_by_path: dict[Path, str] = {}
-
-    for key, files in duplicate_groups.items():
-        for p in files:
-            rp = p.resolve()
-            duplicate_paths.add(rp)
-            duplicate_key_by_path[rp] = key
-
-    existing_row_paths = {r.path.resolve() for r in rows if r.path}
+    existing_row_paths = set(resolved_of.values())
 
     for p in local_files:
         rp = p.resolve()
@@ -166,18 +160,23 @@ def build_audio_table_rows(project_dir: Path, archive_texts: list[str]) -> list[
             continue
 
         status = "UNUSED" if p.name.lower() not in used_names else "NORMAL"
-        rows.append(AudioFileItem(status, p.stat().st_size, str(p.parent), p.name, p, None))
+        row = AudioFileItem(status, _file_size(p), str(p.parent), p.name, p, None)
+        resolved_of[id(row)] = rp
+        rows.append(row)
+
+    duplicate_key_by_path: dict[Path, str] = {}
+    for key, files in detect_duplicate_audio(local_files).items():
+        for p in files:
+            duplicate_key_by_path[p.resolve()] = key
 
     for r in rows:
-        if r.path:
-            rp = r.path.resolve()
-            if rp in duplicate_paths:
-                # Preserve UNUSED priority.
-                # A file that is not referenced by the project must stay UNUSED,
-                # even if its audio content is also a duplicate of another file.
-                # The duplicate_key is still stored for later reporting/cleanup.
-                r.duplicate_key = duplicate_key_by_path.get(rp)
-                if r.status != "UNUSED":
-                    r.status = "DUPLICATE"
+        rp = resolved_of.get(id(r))
+        key = duplicate_key_by_path.get(rp) if rp else None
+        if key:
+            # A file that is not referenced by the project stays UNUSED even if its
+            # content duplicates another file; the duplicate_key is still recorded.
+            r.duplicate_key = key
+            if r.status != "UNUSED":
+                r.status = "DUPLICATE"
 
     return rows

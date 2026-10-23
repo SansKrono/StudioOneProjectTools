@@ -1,29 +1,36 @@
-import tkinter as tk
+import datetime
 import os
-import re
-import traceback
-from tkinter import ttk, filedialog, messagebox
-from pathlib import Path
-import zipfile
-import threading
 import queue
+import re
+import threading
+import tkinter as tk
+import traceback
+from pathlib import Path
+from tkinter import ttk, filedialog, messagebox
 
-from core.song_archive import is_song_file
-from core.plugin_manager import parse_plugins, remove_bypassed_fx, modify_selected_fx
-from core.audio_manager import build_audio_table_rows, format_size
+from core.audio_manager import build_audio_table_rows
+from core.common import app_dir, format_bytes
 from core.consolidate import move_file_to_folder, consolidate_project_to_new_folder
-from core.report_generator import export_txt_report, export_csv_report
-from core.missing_files import search_missing_candidates_everything, recover_missing_to_media_and_relink
-from core.everything import find_es_exe, diagnose_everything, test_everything_available
-from core.settings_manager import load_settings, save_settings
 from core.crash_analyzer import (
-    discover_studio_one_crash_dirs,
-    collect_crash_files,
     analyze_crash_file,
-    format_bytes as format_crash_size,
-    result_to_display_text,
     crash_roots_diagnostics,
+    default_report_dir,
+    discover_crash_files,
+    result_to_display_text,
 )
+from core.everything import find_es_exe, diagnose_everything, test_everything_available
+from core.missing_files import search_missing_candidates_everything, recover_missing_to_media_and_relink
+from core.plugin_manager import parse_plugins, remove_bypassed_fx, modify_selected_fx
+from core.report_generator import export_txt_report, export_csv_report
+from core.settings_manager import load_settings, save_settings
+from core.song_archive import is_song_file, read_text_members
+
+
+def open_folder(path) -> None:
+    """Open a folder in Explorer. Only directories are ever opened, never files."""
+    p = Path(path)
+    if p.is_dir():
+        os.startfile(str(p))
 
 
 class StudioOneProjectToolsApp(tk.Tk):
@@ -40,6 +47,8 @@ class StudioOneProjectToolsApp(tk.Tk):
         self.plugins = []
         self.audio_rows = []
         self.missing_candidates = []
+        self._candidates_by_ref = {}
+        self._candidates_by_name = {}
 
         self.consolidate_running = False
         self.consolidate_queue = queue.Queue()
@@ -58,8 +67,10 @@ class StudioOneProjectToolsApp(tk.Tk):
         self.crash_dump_dirs = []
         self.crash_log_dirs = []
         self.crash_files = []
+        self.crash_files_loaded = False
         self.crash_sort_key = "mtime"
         self.crash_sort_reverse = True
+        self.last_crash_report_folder = None
 
         self.audio_filter = "ALL"
         self.audio_sort_key = None
@@ -79,7 +90,6 @@ class StudioOneProjectToolsApp(tk.Tk):
         detected_es = find_es_exe(configured_es or None)
         self.everything_es_path_var = tk.StringVar(value=str(detected_es) if detected_es else configured_es)
 
-        self.everything_instance_var = tk.StringVar(value=self.settings.get("everything_instance", ""))
         self.studio_one_data_root_var = tk.StringVar(value=self.settings.get("studio_one_data_root", ""))
 
         self._build_ui()
@@ -88,21 +98,19 @@ class StudioOneProjectToolsApp(tk.Tk):
     # Error handling
     # -------------------------
 
-    def log_error(self, title: str, error: Exception):
+    def write_log(self, filename: str, title: str, details: str):
         try:
-            log_path = Path.cwd() / "error_log.txt"
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write("\n" + "=" * 80 + "\n")
-                f.write(title + "\n")
-                f.write(str(error) + "\n")
-                f.write(traceback.format_exc())
-                f.write("\n")
-        except Exception:
+            with (app_dir() / filename).open("a", encoding="utf-8") as f:
+                f.write("\n" + "=" * 80 + "\n" + title + "\n" + details + "\n")
+        except OSError:
             pass
 
     def show_error(self, title: str, error: Exception):
-        self.log_error(title, error)
+        self.write_log("error_log.txt", title, f"{error}\n{traceback.format_exc()}")
         messagebox.showerror(title, f"{error}\n\nDetails saved to error_log.txt")
+
+    def es_path_setting(self) -> str | None:
+        return self.everything_es_path_var.get().strip() or self.settings.get("everything_es_path") or None
 
     # -------------------------
     # UI
@@ -145,6 +153,13 @@ class StudioOneProjectToolsApp(tk.Tk):
         self._build_crash_analyzer_page()
         self._build_settings_page()
 
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _on_tab_changed(self, _event=None):
+        # Crash folders are scanned the first time the tab is opened, not at startup.
+        if self.notebook.select() == str(self.crash_frame) and not self.crash_files_loaded:
+            self.refresh_crash_files()
+
     def _build_menu(self):
         menubar = tk.Menu(self)
 
@@ -180,6 +195,7 @@ class StudioOneProjectToolsApp(tk.Tk):
         ttk.Button(toolbar, text="Expand all", command=self.expand_all_plugin_tracks).pack(side="left", padx=(8, 0))
         ttk.Button(toolbar, text="Collapse all", command=self.collapse_all_plugin_tracks).pack(side="left", padx=(8, 0))
         ttk.Button(toolbar, text="Bypassed FX list", command=self.show_bypassed_fx_list).pack(side="left", padx=(8, 0))
+        ttk.Button(toolbar, text="Save copy without bypassed FX", command=self.remove_bypassed_fx_copy).pack(side="left", padx=(8, 0))
         ttk.Button(toolbar, text="Show all", command=self.clear_plugin_filter).pack(side="left", padx=(8, 0))
 
         ttk.Label(toolbar, text="Search:").pack(side="left", padx=(18, 4))
@@ -353,15 +369,13 @@ class StudioOneProjectToolsApp(tk.Tk):
 
         ttk.Label(outer, text="Consolidate Project", font=("Segoe UI", 16, "bold")).pack(anchor="w")
 
-        self.consolidate_copy_all_referenced = tk.BooleanVar(value=True)
         self.consolidate_recover_missing = tk.BooleanVar(value=True)
         self.consolidate_copy_duplicates = tk.BooleanVar(value=True)
         self.consolidate_copy_unused = tk.BooleanVar(value=False)
         self.consolidate_remove_bypassed = tk.BooleanVar(value=False)
 
         options = [
-            ("Copy all referenced audio into new Media folder", self.consolidate_copy_all_referenced),
-            ("Recover safe FOUND missing audio into new Media folder", self.consolidate_recover_missing),
+            ("Recover safe FOUND missing audio into the new Media folder", self.consolidate_recover_missing),
             ("Copy non-referenced duplicate files to _Duplicates", self.consolidate_copy_duplicates),
             ("Copy unused audio files to _Unused", self.consolidate_copy_unused),
             ("Also create separate no-bypassed-FX .song copy after Consolidate", self.consolidate_remove_bypassed),
@@ -382,9 +396,11 @@ class StudioOneProjectToolsApp(tk.Tk):
         ttk.Label(outer, textvariable=self.consolidate_detail_var, wraplength=900).pack(anchor="w", pady=(0, 8))
 
         help_text = (
-            "Creates a NEW autonomous project folder. Original project is not modified. "
-            "All existing referenced audio is copied to Media and the new .song is relinked to local Media paths. Optional bypassed-FX cleanup creates a second separate .song copy, leaving the main consolidated file untouched. "
-            "If missing files exist, Consolidate automatically runs Everything search and recovers safe FOUND matches."
+            "Creates a NEW self-contained project folder; the original project is not modified. "
+            "All referenced audio is copied, keeping its folder structure inside the project; files from outside "
+            "the project go to External\\ and are relinked. If missing files exist, Everything is searched and safe "
+            "matches are copied to Media and relinked. A post-check reports any references that are still broken. "
+            "The optional bypassed-FX cleanup creates a second .song copy and leaves the main one untouched."
         )
         ttk.Label(outer, text=help_text, wraplength=900).pack(anchor="w", pady=(4, 0))
 
@@ -496,7 +512,7 @@ class StudioOneProjectToolsApp(tk.Tk):
         ttk.Button(top, text="Open logs folder", command=self.open_first_log_folder).pack(side="left", padx=(6, 0))
         ttk.Button(top, text="Open report folder", command=self.open_crash_report_folder).pack(side="left", padx=(6, 0))
 
-        self.crash_status_var = tk.StringVar(value="Ready. Open a .song first for plugin matching, then refresh crash files.")
+        self.crash_status_var = tk.StringVar(value="Open a .song first for plugin matching, then refresh crash files.")
         ttk.Label(outer, textvariable=self.crash_status_var, wraplength=980).pack(anchor="w", pady=(0, 6))
 
         root_box = ttk.LabelFrame(outer, text="Studio One data folder")
@@ -507,9 +523,9 @@ class StudioOneProjectToolsApp(tk.Tk):
         ttk.Entry(root_row, textvariable=self.studio_one_data_root_var).pack(side="left", fill="x", expand=True, padx=(6, 6))
         ttk.Button(root_row, text="Select exact folder...", command=self.select_studio_one_data_root).pack(side="left")
         ttk.Button(root_row, text="Auto", command=self.clear_studio_one_data_root).pack(side="left", padx=(6, 0))
-        ttk.Label(root_box, text="Auto checks %LOCALAPPDATA%\\CrashDumps first, then Fender Studio Pro and Studio One roots. Manual root scans only selected folder.").pack(anchor="w", padx=8, pady=(0, 6))
+        ttk.Label(root_box, text="Auto checks %LOCALAPPDATA%\\CrashDumps first, then Fender Studio Pro and Studio One app-data folders. A manual root scans only the selected folder.").pack(anchor="w", padx=8, pady=(0, 6))
 
-        ttk.Label(root_box, text="Dump analysis is built in: no cdb.exe, no WinDbg, no Windows SDK.").pack(anchor="w", padx=8, pady=(0, 6))
+        ttk.Label(root_box, text=f"Dump analysis is built in and read-only. Reports are saved to {default_report_dir()}").pack(anchor="w", padx=8, pady=(0, 6))
 
         split = ttk.PanedWindow(outer, orient="vertical")
         split.pack(fill="both", expand=True)
@@ -569,8 +585,6 @@ class StudioOneProjectToolsApp(tk.Tk):
         text_frame.rowconfigure(0, weight=1)
         text_frame.columnconfigure(0, weight=1)
 
-        self.refresh_crash_files()
-
     def _build_settings_page(self):
         outer = ttk.Frame(self.settings_frame)
         outer.pack(fill="both", expand=True, padx=16, pady=16)
@@ -591,8 +605,8 @@ class StudioOneProjectToolsApp(tk.Tk):
         ttk.Button(row, text="Save", command=self.save_app_settings).pack(side="left", padx=(6, 0))
 
         help_text = (
-            "Bundled es.exe is detected automatically at startup. "
-            "The tool uses the standard Everything-compatible ES interface without -instance."
+            "es.exe is detected automatically next to the app, on PATH or in Program Files\\Everything. "
+            "It is never picked up from the current working folder. Everything itself must be running."
         )
         ttk.Label(everything_box, text=help_text, wraplength=900).pack(anchor="w", padx=10, pady=(0, 10))
 
@@ -651,20 +665,12 @@ class StudioOneProjectToolsApp(tk.Tk):
             self.show_error("Plugin analysis failed", e)
 
         try:
-            archive_texts = []
-            with zipfile.ZipFile(self.song_path, "r") as z:
-                for name in z.namelist():
-                    if name.lower().endswith((".xml", ".settings", ".txt", ".songdata", ".json")):
-                        try:
-                            archive_texts.append(z.read(name).decode("utf-8", errors="replace"))
-                        except Exception:
-                            pass
-
-            self.audio_rows = build_audio_table_rows(self.project_dir, archive_texts)
+            self.audio_rows = build_audio_table_rows(self.project_dir, read_text_members(self.song_path))
         except Exception as e:
             self.audio_rows = []
             self.show_error("Audio analysis failed", e)
 
+        self.set_missing_candidates([])
         self.populate_plugins()
         self.populate_audio()
         self.update_dashboard()
@@ -982,18 +988,21 @@ class StudioOneProjectToolsApp(tk.Tk):
     # Audio / Files
     # -------------------------
 
+    def set_missing_candidates(self, candidates):
+        self.missing_candidates = list(candidates)
+        self._candidates_by_ref = {}
+        self._candidates_by_name = {}
+        for c in self.missing_candidates:
+            self._candidates_by_ref.setdefault(c.missing_reference, []).append(c)
+            self._candidates_by_name.setdefault(c.filename.lower(), []).append(c)
+
     def audio_candidates_for_item(self, item):
+        if item.status != "MISSING":
+            return []
         ref = item.reference or item.filename
         if not ref:
             return []
-
-        candidates = getattr(self, "missing_candidates", [])
-        exact = [c for c in candidates if c.missing_reference == ref]
-        if exact:
-            return exact
-
-        name = item.filename.lower()
-        return [c for c in candidates if c.filename.lower() == name]
+        return self._candidates_by_ref.get(ref) or self._candidates_by_name.get(item.filename.lower(), [])
 
     def audio_candidate_signature(self, candidate):
         return (candidate.size, candidate.quick_hash)
@@ -1063,7 +1072,7 @@ class StudioOneProjectToolsApp(tk.Tk):
                 iid=str(idx),
                 values=(
                     item.status,
-                    format_size(item.size),
+                    format_bytes(item.size),
                     self.audio_display_folder(item),
                     item.filename,
                     item.reference or "",
@@ -1145,17 +1154,10 @@ class StudioOneProjectToolsApp(tk.Tk):
             return
 
         c = self.audio_candidate_for_item(item)
-        if c and c.source_path.exists():
-            os.startfile(str(c.source_path.parent))
-            return
-
-        if item.path and item.path.exists():
-            os.startfile(str(item.path.parent))
-            return
-
-        if item.folder and Path(item.folder).exists():
-            os.startfile(str(item.folder))
-            return
+        for folder in (c.source_path.parent if c else None, item.path.parent if item.path else None, item.folder or None):
+            if folder and Path(folder).is_dir():
+                open_folder(folder)
+                return
 
         messagebox.showinfo("No location", "This row does not have an existing local path.")
 
@@ -1200,7 +1202,7 @@ class StudioOneProjectToolsApp(tk.Tk):
                 "",
                 "end",
                 iid=str(idx),
-                values=(item.status, format_size(item.size), self.audio_display_folder(item), item.filename, item.reference or "", self.audio_candidate_path_for_item(item)),
+                values=(item.status, format_bytes(item.size), self.audio_display_folder(item), item.filename, item.reference or "", self.audio_candidate_path_for_item(item)),
                 tags=(item.status,),
             )
         self.update_audio_stats()
@@ -1230,9 +1232,9 @@ class StudioOneProjectToolsApp(tk.Tk):
             f"Dup: {counts.get('DUPLICATE', 0)}    "
             f"Unused: {counts.get('UNUSED', 0)}    "
             f"Miss: {counts.get('MISSING', 0)}    "
-            f"Total: {format_size(total_size)}    "
-            f"Dup: {format_size(duplicate_size)}    "
-            f"Unused: {format_size(unused_size)}"
+            f"Total: {format_bytes(total_size)}    "
+            f"Dup: {format_bytes(duplicate_size)}    "
+            f"Unused: {format_bytes(unused_size)}"
         )
 
         self.audio_stats_label.config(text=text)
@@ -1246,6 +1248,16 @@ class StudioOneProjectToolsApp(tk.Tk):
         movable = [item for item in selected if item.path and item.path.exists()]
         if not movable:
             messagebox.showinfo("No movable files", "Selected rows do not contain existing local files.")
+            return
+
+        referenced = [item for item in movable if item.reference]
+        message = f"Move {len(movable)} file(s) out of their current folder?\n\nFiles are moved, not deleted."
+        if referenced:
+            message += (
+                f"\n\nWARNING: {len(referenced)} of them are used by the project. "
+                "Moving them will make them MISSING when you open the original .song."
+            )
+        if not messagebox.askyesno("Move selected audio", message + "\n\nContinue?", icon="warning" if referenced else "question"):
             return
 
         target = filedialog.askdirectory(title="Move selected audio to folder")
@@ -1271,10 +1283,33 @@ class StudioOneProjectToolsApp(tk.Tk):
         self.analyze_project()
 
     def move_duplicate_audio(self):
-        duplicates = [r for r in self.audio_rows if r.status == "DUPLICATE" and r.path and r.path.exists() and r.duplicate_key]
+        """
+        Move duplicate side files out of the project.
 
-        if not duplicates:
-            messagebox.showinfo("No duplicates", "No duplicate audio files detected.")
+        A file the project references is never moved. In a duplicate group where
+        nothing is referenced, the first file (by path) is kept.
+        """
+        by_group = {}
+        for r in self.audio_rows:
+            if r.status == "DUPLICATE" and r.duplicate_key and r.path and r.path.exists():
+                by_group.setdefault(r.duplicate_key, []).append(r)
+
+        to_move = []
+        for group in by_group.values():
+            group = sorted(group, key=lambda r: str(r.path).lower())
+            keep_any = not any(r.reference for r in group)
+            to_move += [r for i, r in enumerate(group) if not r.reference and not (keep_any and i == 0)]
+
+        if not to_move:
+            messagebox.showinfo("No duplicate side files", "No unreferenced duplicate audio files to move.")
+            return
+
+        if not messagebox.askyesno(
+            "Move duplicate side files",
+            f"Duplicate groups: {len(by_group)}\n"
+            f"Unreferenced duplicate files to move: {len(to_move)}\n\n"
+            "Files used by the project stay where they are. Files are moved, not deleted.\n\nContinue?",
+        ):
             return
 
         target = filedialog.askdirectory(title="Move duplicate audio to folder")
@@ -1282,26 +1317,17 @@ class StudioOneProjectToolsApp(tk.Tk):
             return
 
         target_dir = Path(target)
-        by_group = {}
-        for item in duplicates:
-            by_group.setdefault(item.duplicate_key, []).append(item)
-
         moved = 0
-        kept = 0
         errors = []
 
-        for key, group in by_group.items():
-            group = sorted(group, key=lambda r: str(r.path).lower())
-            kept += 1
-            for item in group[1:]:
-                try:
-                    if item.path and item.path.exists():
-                        move_file_to_folder(item.path, target_dir)
-                        moved += 1
-                except Exception as e:
-                    errors.append(f"{item.filename}: {e}")
+        for item in to_move:
+            try:
+                move_file_to_folder(item.path, target_dir)
+                moved += 1
+            except OSError as e:
+                errors.append(f"{item.filename}: {e}")
 
-        message = f"Duplicate groups: {len(by_group)}\nKept originals: {kept}\nMoved duplicates: {moved}"
+        message = f"Duplicate groups: {len(by_group)}\nMoved duplicate side files: {moved}"
         if errors:
             message += "\n\nErrors:\n" + "\n".join(errors[:20])
 
@@ -1358,7 +1384,7 @@ class StudioOneProjectToolsApp(tk.Tk):
             messagebox.showinfo("No missing files", "No missing audio references detected.")
             return
 
-        es = find_es_exe(self.everything_es_path_var.get().strip() or self.settings.get("everything_es_path") or None)
+        es = find_es_exe(self.es_path_setting())
         if not es:
             messagebox.showerror(
                 "Missing file search unavailable",
@@ -1367,12 +1393,7 @@ class StudioOneProjectToolsApp(tk.Tk):
             return
 
         try:
-            self.missing_candidates = search_missing_candidates_everything(
-                self.audio_rows,
-                es_path=self.everything_es_path_var.get().strip() or self.settings.get("everything_es_path") or None,
-                instance=None,
-                mode="default",
-            )
+            self.set_missing_candidates(search_missing_candidates_everything(self.audio_rows, es_path=self.es_path_setting()))
         except Exception as e:
             self.show_error("Missing file search failed", e)
             return
@@ -1435,7 +1456,7 @@ class StudioOneProjectToolsApp(tk.Tk):
             messagebox.showinfo("No missing files", "No missing audio references detected.")
             return
 
-        es = find_es_exe(self.everything_es_path_var.get().strip() or self.settings.get("everything_es_path") or None)
+        es = find_es_exe(self.es_path_setting())
         if not es:
             messagebox.showerror(
                 "Missing file search unavailable",
@@ -1444,11 +1465,7 @@ class StudioOneProjectToolsApp(tk.Tk):
             return
 
         try:
-            self.missing_candidates = search_missing_candidates_everything(
-                self.audio_rows,
-                es_path=self.settings.get("everything_es_path") or None,
-                instance=self.settings.get("everything_instance") or None,
-            )
+            self.set_missing_candidates(search_missing_candidates_everything(self.audio_rows, es_path=self.es_path_setting()))
         except Exception as e:
             self.show_error("Missing file search failed", e)
             return
@@ -1605,7 +1622,7 @@ class StudioOneProjectToolsApp(tk.Tk):
                     lines.append(f"Identical copies found: {same_count}")
                     lines.append(f"Source size:   {c.size if c.size is not None else ''}")
                     lines.append(f"Quick hash:    {c.quick_hash or ''}")
-                    lines.append(f"Confidence:    size + first/last MB quick hash")
+                    lines.append("Confidence:    size + first/last MB quick hash")
                 lines.append(f"Copied to:     {dest}")
                 try:
                     rel = dest.resolve().relative_to(self.project_dir.resolve())
@@ -1723,7 +1740,6 @@ class StudioOneProjectToolsApp(tk.Tk):
 
     def save_app_settings(self):
         self.settings["everything_es_path"] = self.everything_es_path_var.get().strip()
-        self.settings["everything_instance"] = ""
         self.settings["media_folder_name"] = self.media_folder_var.get().strip() or "Media"
         self.settings["duplicates_folder_name"] = self.duplicates_folder_var.get().strip() or "_Duplicates"
         self.settings["unused_folder_name"] = self.unused_folder_var.get().strip() or "_Unused"
@@ -1739,12 +1755,12 @@ class StudioOneProjectToolsApp(tk.Tk):
 
         try:
             quick = test_everything_available(path or None)
-            report = diagnose_everything(path or None, None, "default")
+            report = diagnose_everything(path or None)
         except Exception as e:
             self.show_error("Everything test failed", e)
             return
 
-        log_path = Path.cwd() / "everything_diagnostics.txt"
+        log_path = app_dir() / "everything_diagnostics.txt"
         try:
             log_path.write_text(report, encoding="utf-8")
         except Exception:
@@ -1773,10 +1789,10 @@ class StudioOneProjectToolsApp(tk.Tk):
                 "",
                 reason,
                 "",
-                f"Detected es.exe:",
+                "Detected es.exe:",
                 str(exe),
                 "",
-                f"Command:",
+                "Command:",
                 str(cmd),
                 "",
                 f"Return code: {rc}",
@@ -1785,7 +1801,7 @@ class StudioOneProjectToolsApp(tk.Tk):
                 details += ["", "Error:", stderr[:1200]]
             elif stdout:
                 details += ["", "Output:", stdout[:1200]]
-            details += ["", f"Full diagnostics saved to:", str(log_path)]
+            details += ["", "Full diagnostics saved to:", str(log_path)]
             messagebox.showerror("Everything test failed", "\n".join(details))
 
 
@@ -1822,13 +1838,6 @@ class StudioOneProjectToolsApp(tk.Tk):
         if not self.song_path or not self.project_dir:
             messagebox.showinfo("No project", "Open and analyze a .song file first.")
             return
-
-        if not self.consolidate_copy_all_referenced.get():
-            messagebox.showwarning(
-                "Unsafe option",
-                "Consolidate requires copying all referenced audio into the new Media folder.\n\n"
-                "This option is locked logically for v1; it will still copy all referenced audio."
-            )
 
         missing_count = sum(1 for a in self.audio_rows if a.status == "MISSING")
 
@@ -1871,11 +1880,8 @@ class StudioOneProjectToolsApp(tk.Tk):
             "recover_missing": self.consolidate_recover_missing.get(),
             "copy_unused": self.consolidate_copy_unused.get(),
             "copy_duplicate_nonreferenced": self.consolidate_copy_duplicates.get(),
-            "remove_bypassed_fx": False,
             "create_no_bypassed_copy": self.consolidate_remove_bypassed.get(),
-            "es_path": self.everything_es_path_var.get().strip() or self.settings.get("everything_es_path") or None,
-            "instance": None,
-            "mode": "default",
+            "es_path": self.es_path_setting(),
         }
 
         self.consolidate_running = True
@@ -1930,8 +1936,6 @@ class StudioOneProjectToolsApp(tk.Tk):
                     options["audio_rows"],
                     max_results_per_file=12,
                     es_path=options["es_path"],
-                    instance=options["instance"],
-                    mode=options.get("mode") or "auto",
                 )
 
                 candidate_refs = {c.missing_reference for c in missing_candidates}
@@ -1956,7 +1960,6 @@ class StudioOneProjectToolsApp(tk.Tk):
                 recover_missing=options["recover_missing"],
                 copy_unused=options["copy_unused"],
                 copy_duplicate_nonreferenced=options["copy_duplicate_nonreferenced"],
-                remove_bypassed_fx=False,
                 progress_callback=progress_callback,
             )
 
@@ -1969,11 +1972,8 @@ class StudioOneProjectToolsApp(tk.Tk):
                     "status": "Creating separate no-bypassed-FX .song copy...",
                     "detail": "Main consolidated .song stays untouched."
                 })
-                clean_song = result.output_dir / f"{result.output_song.stem}_no_bypassed_fx.song"
-                remove_bypassed_fx(result.output_song, clean_song)
-                setattr(result, "no_bypassed_song", clean_song)
-            else:
-                setattr(result, "no_bypassed_song", None)
+                result.no_bypassed_song = result.output_dir / f"{result.output_song.stem}_no_bypassed_fx.song"
+                remove_bypassed_fx(result.output_song, result.no_bypassed_song)
 
             self.consolidate_queue.put({"type": "done", "result": result})
         except Exception as e:
@@ -2006,16 +2006,7 @@ class StudioOneProjectToolsApp(tk.Tk):
             self.consolidate_running = False
             self.consolidate_status_var.set("Consolidate failed.")
             self.consolidate_detail_var.set(str(msg.get("error", "")))
-            try:
-                log_path = Path.cwd() / "error_log.txt"
-                with log_path.open("a", encoding="utf-8") as f:
-                    f.write("\n" + "=" * 80 + "\n")
-                    f.write("Consolidate worker failed\n")
-                    f.write(str(msg.get("error", "")) + "\n")
-                    f.write(msg.get("traceback", ""))
-                    f.write("\n")
-            except Exception:
-                pass
+            self.write_log("error_log.txt", "Consolidate worker failed", f"{msg.get('error', '')}\n{msg.get('traceback', '')}")
             messagebox.showerror("Consolidate failed", f"{msg.get('error')}\n\nDetails saved to error_log.txt")
             return
 
@@ -2040,32 +2031,19 @@ class StudioOneProjectToolsApp(tk.Tk):
                 f"Skipped ambiguous: {result.skipped_ambiguous}",
                 f"Unused side copies: {result.copied_unused}",
                 f"Duplicate side copies: {result.copied_duplicates}",
-                f"Main consolidated .song keeps bypassed FX unchanged.",
-                f"No-bypassed-FX copy:\n{getattr(result, 'no_bypassed_song', '') or 'not created'}",
-                f"Relink replacement hits: {getattr(result, 'relink_replacements', 0)}",
-                f"Post-check missing after consolidate: {getattr(result, 'verify_missing_after', 'n/a')}",
+                "Main consolidated .song keeps bypassed FX unchanged.",
+                f"No-bypassed-FX copy:\n{result.no_bypassed_song or 'not created'}",
+                f"Relink replacements: {result.relink_replacements}",
+                f"Post-check broken references: {result.verify_missing_after}",
                 f"Errors: {len(result.errors)}",
                 "",
                 f"Report:\n{result.report_path}",
-                f"Relink debug:\n{getattr(result, 'relink_debug_report_path', '')}",
+                f"Relink debug:\n{result.relink_debug_report_path}",
             ]
 
             messagebox.showinfo("Consolidate complete", "\n".join(msg_lines))
 
-            try:
-                os.startfile(str(result.output_dir))
-            except Exception:
-                pass
-
-    def _format_bytes_local(self, value: int | float | None) -> str:
-        if value is None:
-            return "0 B"
-        value = float(value)
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
-            if abs(value) < 1024:
-                return f"{value:.1f} {unit}" if unit != "B" else f"{value:.0f} {unit}"
-            value /= 1024
-        return f"{value:.1f} PB"
+            open_folder(result.output_dir)
 
     def _update_consolidate_progress(self, msg: dict):
         phase = msg.get("phase", "")
@@ -2076,7 +2054,7 @@ class StudioOneProjectToolsApp(tk.Tk):
             total_files = msg.get("total_files", 0)
             self.consolidate_status_var.set("Copy plan ready.")
             self.consolidate_detail_var.set(
-                f"{total_files} referenced audio files / {self._format_bytes_local(self.consolidate_total_bytes)}"
+                f"{total_files} referenced audio files / {format_bytes(self.consolidate_total_bytes)}"
             )
             self.consolidate_progress.configure(maximum=max(self.consolidate_total_bytes, 1), value=0)
             return
@@ -2118,14 +2096,14 @@ class StudioOneProjectToolsApp(tk.Tk):
         cur_total = int(msg.get("current_total_bytes") or self.consolidate_current_file_total or 0)
 
         detail = (
-            f"Total copied: {self._format_bytes_local(copied)} / {self._format_bytes_local(self.consolidate_total_bytes)} "
+            f"Total copied: {format_bytes(copied)} / {format_bytes(self.consolidate_total_bytes)} "
             f"({pct:.1f}%)"
         )
 
         if current_file:
             detail += (
                 f" | Current: {current_file} "
-                f"{self._format_bytes_local(cur_copied)} / {self._format_bytes_local(cur_total)}"
+                f"{format_bytes(cur_copied)} / {format_bytes(cur_total)}"
             )
 
         file_index = msg.get("file_index")
@@ -2134,7 +2112,6 @@ class StudioOneProjectToolsApp(tk.Tk):
             detail += f" | File {file_index}/{total_files}"
 
         self.consolidate_detail_var.set(detail)
-
 
 
     # -------------------------
@@ -2153,66 +2130,31 @@ class StudioOneProjectToolsApp(tk.Tk):
 
     def open_batch_output_folder(self):
         folder = self.batch_output_var.get().strip()
-        if folder and Path(folder).exists():
-            try:
-                os.startfile(folder)
-            except Exception:
-                pass
-
-    def _read_song_archive_texts_for_batch(self, song_path: Path) -> list[str]:
-        archive_texts = []
-        with zipfile.ZipFile(song_path, "r") as z:
-            for name in z.namelist():
-                if name.lower().endswith((".xml", ".settings", ".txt", ".songdata", ".json")):
-                    try:
-                        archive_texts.append(z.read(name).decode("utf-8", errors="replace"))
-                    except Exception:
-                        pass
-        return archive_texts
+        if folder:
+            open_folder(folder)
 
 
-    def _is_autosave_or_backup_song(self, path: Path) -> bool:
+    _AUTOSAVE_FOLDER_TOKENS = ("autosave", "auto-save", "auto save", "backup", "history", "versions", "recovery", "recovered")
+    _AUTOSAVE_NAME_RE = re.compile(r"autosav|auto[-_ ]?save|backup|recovery|recovered|history|crash|restore")
+
+    def _is_autosave_or_backup_song(self, path: Path, input_folder: Path) -> bool:
         """
-        Filters Studio One autosave/backup/history/recovery projects from Batch scan.
-        Conservative: only used when the checkbox is enabled.
+        Filters Studio One autosave/backup/history/recovery projects from a Batch scan.
+
+        Only folders *below* the chosen input folder are checked, so a library that
+        happens to live under e.g. D:/Backups/Music is not skipped entirely.
+        Only used when the checkbox is enabled.
         """
-        text = str(path).lower()
-        name = path.name.lower()
-        parent_parts = [p.lower() for p in path.parts]
+        try:
+            folders = [part.lower() for part in path.relative_to(input_folder).parts[:-1]]
+        except ValueError:
+            folders = []
 
-        folder_tokens = [
-            "autosave", "auto-save", "auto save",
-            "backup", "backups",
-            "history", "versions",
-            "recovery", "recovered",
-            "crash", "restore",
-            "autosaves",
-        ]
-
-        name_tokens = [
-            "autosave", "auto-save", "auto save",
-            "backup", "history", "recovery", "recovered",
-            "crash", "restore",
-        ]
-
-        if any(tok in text for tok in folder_tokens):
+        if any(tok in folder for folder in folders for tok in self._AUTOSAVE_FOLDER_TOKENS):
             return True
 
-        if any(tok in name for tok in name_tokens):
-            return True
-
-        # Common Studio One backup/autosave naming patterns.
-        # Examples: "Song (Autosaved).song", "Song - backup.song", "Song.backup.song"
-        patterns = [
-            r"autosav",
-            r"auto[-_ ]?save",
-            r"backup",
-            r"recovery",
-            r"recovered",
-            r"history",
-            r"crash",
-        ]
-        return any(re.search(pat, name) for pat in patterns)
+        # e.g. "Song (Autosaved).song", "Song - backup.song", "Song.backup.song"
+        return bool(self._AUTOSAVE_NAME_RE.search(path.stem.lower()))
 
     def scan_batch_projects(self):
         if self.batch_running:
@@ -2236,7 +2178,7 @@ class StudioOneProjectToolsApp(tk.Tk):
                 continue
             if p.name.lower().endswith("_no_bypassed_fx.song"):
                 continue
-            if self.batch_ignore_autosaves_var.get() and self._is_autosave_or_backup_song(p):
+            if self.batch_ignore_autosaves_var.get() and self._is_autosave_or_backup_song(p, input_folder):
                 skipped_autosaves += 1
                 continue
             try:
@@ -2314,9 +2256,7 @@ class StudioOneProjectToolsApp(tk.Tk):
             "media_folder_name": self.settings.get("media_folder_name", "Media"),
             "duplicates_folder_name": self.settings.get("duplicates_folder_name", "_Duplicates"),
             "unused_folder_name": self.settings.get("unused_folder_name", "_Unused"),
-            "es_path": self.everything_es_path_var.get().strip() or self.settings.get("everything_es_path") or None,
-            "instance": None,
-            "mode": "default",
+            "es_path": self.es_path_setting(),
         }
 
         self.batch_worker = threading.Thread(target=self._batch_worker_entry, args=(options,), daemon=True)
@@ -2337,8 +2277,7 @@ class StudioOneProjectToolsApp(tk.Tk):
                 })
 
                 project_dir = song_path.parent
-                archive_texts = self._read_song_archive_texts_for_batch(song_path)
-                audio_rows = build_audio_table_rows(project_dir, archive_texts)
+                audio_rows = build_audio_table_rows(project_dir, read_text_members(song_path))
 
                 missing_count = sum(1 for r in audio_rows if r.status == "MISSING")
                 missing_candidates = []
@@ -2357,8 +2296,6 @@ class StudioOneProjectToolsApp(tk.Tk):
                             audio_rows,
                             max_results_per_file=12,
                             es_path=options["es_path"],
-                            instance=options["instance"],
-                            mode=options.get("mode") or "auto",
                         )
                     else:
                         self.batch_queue.put({
@@ -2388,7 +2325,6 @@ class StudioOneProjectToolsApp(tk.Tk):
                     recover_missing=options["recover_missing"],
                     copy_unused=options["copy_unused"],
                     copy_duplicate_nonreferenced=options["copy_duplicates"],
-                    remove_bypassed_fx=False,
                     progress_callback=progress_callback,
                 )
 
@@ -2399,9 +2335,8 @@ class StudioOneProjectToolsApp(tk.Tk):
                         "status": "Creating no-bypassed copy",
                         "detail": result.output_song.name,
                     })
-                    clean_song = result.output_dir / f"{result.output_song.stem}_no_bypassed_fx.song"
-                    remove_bypassed_fx(result.output_song, clean_song)
-                    setattr(result, "no_bypassed_song", clean_song)
+                    result.no_bypassed_song = result.output_dir / f"{result.output_song.stem}_no_bypassed_fx.song"
+                    remove_bypassed_fx(result.output_song, result.no_bypassed_song)
 
                 self.batch_queue.put({
                     "type": "project_done",
@@ -2466,14 +2401,14 @@ class StudioOneProjectToolsApp(tk.Tk):
             total_bytes = msg.get("total_bytes") or msg.get("current_total_bytes") or 0
             copied = msg.get("current_copied_bytes") or 0
             if current_file:
-                self.batch_detail_var.set(f"Current: {current_file} | {self._format_bytes_local(copied)} / {self._format_bytes_local(total_bytes)}")
+                self.batch_detail_var.set(f"Current: {current_file} | {format_bytes(copied)} / {format_bytes(total_bytes)}")
             else:
                 self.batch_detail_var.set("")
             return
 
         if mtype == "project_done":
             result = msg.get("result")
-            missing_after = getattr(result, "verify_missing_after", 0)
+            missing_after = result.verify_missing_after
             status = "Done" if not missing_after else f"WARN missing {missing_after}"
             if self.batch_tree.exists(str(idx)):
                 self.batch_tree.set(str(idx), "status", status)
@@ -2492,15 +2427,7 @@ class StudioOneProjectToolsApp(tk.Tk):
             self.batch_progress.configure(value=msg.get("done_count", 0))
             self.batch_status_var.set(f"Error in project {idx + 1}: {msg.get('error', '')}")
 
-            try:
-                log_path = Path.cwd() / "batch_error_log.txt"
-                with log_path.open("a", encoding="utf-8") as f:
-                    f.write("\n" + "=" * 80 + "\n")
-                    f.write(msg.get("project", "") + "\n")
-                    f.write(msg.get("error", "") + "\n")
-                    f.write(msg.get("traceback", "") + "\n")
-            except Exception:
-                pass
+            self.write_log("batch_error_log.txt", msg.get("project", ""), f"{msg.get('error', '')}\n{msg.get('traceback', '')}")
             return
 
         if mtype == "batch_done":
@@ -2509,77 +2436,63 @@ class StudioOneProjectToolsApp(tk.Tk):
             self.batch_detail_var.set("Check output folders and reports.")
             messagebox.showinfo("Batch complete", f"Batch complete.\nProjects processed: {msg.get('total', 0)}")
 
-
-
     # -------------------------
     # Crash Analyzer
     # -------------------------
 
+    def _crash_root(self) -> str | None:
+        return self.studio_one_data_root_var.get().strip() or None
+
+    def _save_crash_root(self, folder: str):
+        self.studio_one_data_root_var.set(folder)
+        self.settings["studio_one_data_root"] = folder
+        try:
+            save_settings(self.settings)
+        except OSError as e:
+            self.show_error("Save settings failed", e)
+        self.refresh_crash_files()
 
     def select_studio_one_data_root(self):
         folder = filedialog.askdirectory(title="Select exact dumps/logs folder or Studio One data folder")
         if folder:
-            self.studio_one_data_root_var.set(folder)
-            self.settings["studio_one_data_root"] = folder
-            save_settings(self.settings)
-            self.refresh_crash_files()
+            self._save_crash_root(folder)
 
     def clear_studio_one_data_root(self):
-        self.studio_one_data_root_var.set("")
-        self.settings["studio_one_data_root"] = ""
-        save_settings(self.settings)
-        self.refresh_crash_files()
-
+        self._save_crash_root("")
 
     def diagnose_crash_roots(self):
         try:
-            text = crash_roots_diagnostics(self.studio_one_data_root_var.get().strip() or None)
-            if hasattr(self, "crash_result_text"):
-                self.crash_result_text.delete("1.0", "end")
-                self.crash_result_text.insert("1.0", text)
-                self.apply_crash_result_highlighting()
-            self.crash_status_var.set("Crash/log roots diagnostics complete.")
+            text = crash_roots_diagnostics(self._crash_root())
         except Exception as e:
             self.show_error("Crash/log roots diagnostics failed", e)
-
-
-
+            return
+        self.crash_result_text.delete("1.0", "end")
+        self.crash_result_text.insert("1.0", text)
+        self.apply_crash_result_highlighting()
+        self.crash_status_var.set("Crash/log roots diagnostics complete.")
 
     def _sort_crash_files_current(self):
-        key = getattr(self, "crash_sort_key", "mtime")
-        reverse = getattr(self, "crash_sort_reverse", True)
-
-        def sort_value(cf):
-            if key == "mtime":
-                return cf.mtime
-            if key == "size":
-                return cf.size
-            if key == "kind":
-                return cf.kind.lower()
-            if key == "file":
-                return cf.path.name.lower()
-            if key == "path":
-                return str(cf.path).lower()
-            return cf.mtime
-
-        self.crash_files.sort(key=sort_value, reverse=reverse)
+        sort_values = {
+            "mtime": lambda cf: cf.mtime,
+            "size": lambda cf: cf.size,
+            "kind": lambda cf: cf.kind.lower(),
+            "file": lambda cf: cf.path.name.lower(),
+            "path": lambda cf: str(cf.path).lower(),
+        }
+        self.crash_files.sort(key=sort_values.get(self.crash_sort_key, sort_values["mtime"]), reverse=self.crash_sort_reverse)
 
     def sort_crash_files_by(self, key: str):
-        if getattr(self, "crash_sort_key", None) == key:
-            self.crash_sort_reverse = not getattr(self, "crash_sort_reverse", True)
+        if self.crash_sort_key == key:
+            self.crash_sort_reverse = not self.crash_sort_reverse
         else:
             self.crash_sort_key = key
-            # Default for date/size is newest/biggest first; text columns A-Z.
-            self.crash_sort_reverse = True if key in {"mtime", "size"} else False
+            # Date/size default to newest/biggest first; text columns A-Z.
+            self.crash_sort_reverse = key in {"mtime", "size"}
 
         self._sort_crash_files_current()
         self.populate_crash_tree()
 
     def populate_crash_tree(self):
-        if not hasattr(self, "crash_tree"):
-            return
-
-        import datetime
         self.crash_tree.delete(*self.crash_tree.get_children())
 
         for i, cf in enumerate(self.crash_files):
@@ -2589,109 +2502,75 @@ class StudioOneProjectToolsApp(tk.Tk):
                 "end",
                 iid=str(i),
                 text=cf.path.name,
-                values=(cf.kind, format_crash_size(cf.size), modified, str(cf.mtime), str(cf.path)),
+                values=(cf.kind, format_bytes(cf.size), modified, str(cf.mtime), str(cf.path)),
             )
 
     def refresh_crash_files(self):
+        self.crash_status_var.set("Scanning crash/log folders...")
+        self.update_idletasks()
+
         try:
-            self.crash_dump_dirs, self.crash_log_dirs = discover_studio_one_crash_dirs(self.studio_one_data_root_var.get().strip() or None)
-            self.crash_files = collect_crash_files(self.crash_dump_dirs, self.crash_log_dirs, limit=200)
+            self.crash_files, self.crash_dump_dirs, self.crash_log_dirs = discover_crash_files(self._crash_root(), limit=200)
         except Exception as e:
             self.show_error("Crash file discovery failed", e)
             return
 
+        self.crash_files_loaded = True
         self._sort_crash_files_current()
-        if hasattr(self, "crash_tree"):
-            self.populate_crash_tree()
+        self.populate_crash_tree()
 
-
-        manual_root = self.studio_one_data_root_var.get().strip()
-        active_root = manual_root or "%LOCALAPPDATA%\\CrashDumps + Fender Studio Pro + Studio One roots"
+        manual_root = self._crash_root()
+        active_root = manual_root or "%LOCALAPPDATA%\\CrashDumps + Fender Studio Pro + Studio One app data"
         mode = "manual root only" if manual_root else "auto"
         self.crash_status_var.set(
-            f"Mode: {mode} | Root: {active_root} | Found crash files: {len(self.crash_files)} | dump folders: {len(self.crash_dump_dirs)} | log folders: {len(self.crash_log_dirs)} | analyzer: built-in dump reader"
+            f"Mode: {mode} | Root: {active_root} | Crash files: {len(self.crash_files)} | "
+            f"dump folders: {len(self.crash_dump_dirs)} | log folders: {len(self.crash_log_dirs)}"
         )
-
-
-
-    def configure_crash_text_tags(self):
-        try:
-            self.crash_result_text.tag_configure("crash_hiscore", foreground="red")
-            self.crash_result_text.tag_configure("crash_section", foreground="#003366")
-        except Exception:
-            pass
 
     def apply_crash_result_highlighting(self):
         """
-        Highlight strongest evidence in Crash Analyzer output.
-
-        Rules:
-        - max score= is highlighted red for project FX matches;
-        - max rank= is highlighted red for generic non-system module evidence;
-        - works without vendor hardcoding.
+        Highlight the strongest evidence in the Crash Analyzer output:
+        the max score= line (project FX matches) and the max rank= line (any non-system module).
         """
-        try:
-            self.configure_crash_text_tags()
-            text_widget = self.crash_result_text
-            text_widget.tag_remove("crash_hiscore", "1.0", "end")
-            text_widget.tag_remove("crash_section", "1.0", "end")
+        text_widget = self.crash_result_text
+        text_widget.tag_remove("crash_hiscore", "1.0", "end")
+        text_widget.tag_remove("crash_section", "1.0", "end")
 
-            full_text = text_widget.get("1.0", "end-1c")
-            scores = [int(x) for x in re.findall(r"\bscore=(\d+)\b", full_text)]
-            ranks = [int(x) for x in re.findall(r"\brank=(\d+)\b", full_text)]
-            max_score = max(scores) if scores else None
-            max_rank = max(ranks) if ranks else None
+        full_text = text_widget.get("1.0", "end-1c")
+        scores = [int(x) for x in re.findall(r"\bscore=(\d+)\b", full_text)]
+        ranks = [int(x) for x in re.findall(r"\brank=\s*(\d+)\b", full_text)]
+        max_score = max(scores) if scores else None
+        max_rank = max(ranks) if ranks else None
 
-            lines = full_text.splitlines()
-            heading_markers = (
-                "Project FX matched",
-                "Top Exception Thread",
-                "Top All-Thread",
-                "Loaded project FX",
-                "Loaded Module Counts",
-                "Exception",
-                "Fault surface module",
+        heading_markers = (
+            "Project FX matched",
+            "Top Exception Thread",
+            "Top All-Thread",
+            "Loaded project FX",
+            "Loaded Module Counts",
+            "Exception",
+            "Fault surface module",
+        )
+
+        for line_no, line in enumerate(full_text.splitlines(), start=1):
+            if line.strip().startswith(heading_markers):
+                text_widget.tag_add("crash_section", f"{line_no}.0", f"{line_no}.end")
+
+            hit = (max_score is not None and re.search(rf"\bscore={max_score}\b", line)) or (
+                max_rank is not None and re.search(rf"\brank=\s*{max_rank}\b", line)
             )
+            if hit:
+                text_widget.tag_add("crash_hiscore", f"{line_no}.0", f"{line_no}.end")
 
-            for line_no, line in enumerate(lines, start=1):
-                stripped = line.strip()
-
-                if any(stripped.startswith(m) for m in heading_markers):
-                    text_widget.tag_add("crash_section", f"{line_no}.0", f"{line_no}.end")
-
-                hit = False
-                if max_score is not None and re.search(rf"\bscore={max_score}\b", line):
-                    hit = True
-                if max_rank is not None and re.search(rf"\brank={max_rank}\b", line):
-                    hit = True
-
-                if hit:
-                    text_widget.tag_add("crash_hiscore", f"{line_no}.0", f"{line_no}.end")
-
-            parts = []
-            if max_score is not None:
-                parts.append(f"score={max_score}")
-            if max_rank is not None:
-                parts.append(f"rank={max_rank}")
-            if parts:
-                self.crash_status_var.set("Highlighted: " + ", ".join(parts))
-            else:
-                self.crash_status_var.set("No score= or rank= values found to highlight.")
-        except Exception as e:
-            try:
-                self.crash_status_var.set(f"Highlight failed: {e}")
-            except Exception:
-                pass
-
+        parts = [f"score={max_score}"] * (max_score is not None) + [f"rank={max_rank}"] * (max_rank is not None)
+        self.crash_status_var.set("Highlighted: " + ", ".join(parts) if parts else "No score= or rank= values found to highlight.")
 
     def _selected_crash_file(self):
-        sel = self.crash_tree.selection() if hasattr(self, "crash_tree") else []
+        sel = self.crash_tree.selection()
         if not sel:
             return None
         idx = int(sel[0])
-        if idx < 0 or idx >= len(self.crash_files):
-            return None
-        return self.crash_files[idx]
+        return self.crash_files[idx] if 0 <= idx < len(self.crash_files) else None
 
     def analyze_latest_crash_file(self):
         if not self.crash_files:
@@ -2717,77 +2596,48 @@ class StudioOneProjectToolsApp(tk.Tk):
         self.update_idletasks()
 
         try:
-            output_dir = cf.path.parent / "StudioOneProjectTools_CrashReports"
-            result = analyze_crash_file(
-                cf.path,
-                plugins=self.plugins,
-                output_dir=output_dir,
-            )
-            txt = result_to_display_text(result)
-            self.crash_result_text.delete("1.0", "end")
-            self.crash_result_text.insert("1.0", txt)
-            self.apply_crash_result_highlighting()
-            self.crash_status_var.set(f"Analysis complete: {cf.path.name}")
-            if result.report_path:
-                self.last_crash_report_folder = result.report_path.parent
+            result = analyze_crash_file(cf.path, plugins=self.plugins)
         except Exception as e:
             self.show_error("Crash analysis failed", e)
+            return
+
+        self.crash_result_text.delete("1.0", "end")
+        self.crash_result_text.insert("1.0", result_to_display_text(result))
+        self.apply_crash_result_highlighting()
+        self.crash_status_var.set(f"Analysis complete: {cf.path.name}")
+        if result.report_path:
+            self.last_crash_report_folder = result.report_path.parent
 
     def copy_crash_result(self):
-        if not hasattr(self, "crash_result_text"):
-            return
-        text = self.crash_result_text.get("1.0", "end").strip()
         self.clipboard_clear()
-        self.clipboard_append(text)
+        self.clipboard_append(self.crash_result_text.get("1.0", "end").strip())
 
     def open_selected_crash_location(self):
         cf = self._selected_crash_file()
-        if not cf:
-            return
-        try:
-            os.startfile(str(cf.path.parent))
-        except Exception:
-            pass
+        if cf:
+            open_folder(cf.path.parent)
+
+    def _open_first(self, folders_attr: str, what: str):
+        if not getattr(self, folders_attr):
+            self.refresh_crash_files()
+        folders = getattr(self, folders_attr)
+        if folders:
+            open_folder(folders[0])
+        else:
+            messagebox.showinfo("Crash Analyzer", f"No Studio One {what} folder found.")
 
     def open_first_dump_folder(self):
-        if not self.crash_dump_dirs:
-            self.refresh_crash_files()
-        if self.crash_dump_dirs:
-            try:
-                os.startfile(str(self.crash_dump_dirs[0]))
-            except Exception:
-                pass
-        else:
-            messagebox.showinfo("Crash Analyzer", "No Studio One dump folder found.")
+        self._open_first("crash_dump_dirs", "dump")
 
     def open_first_log_folder(self):
-        if not self.crash_log_dirs:
-            self.refresh_crash_files()
-        if self.crash_log_dirs:
-            try:
-                os.startfile(str(self.crash_log_dirs[0]))
-            except Exception:
-                pass
-        else:
-            messagebox.showinfo("Crash Analyzer", "No Studio One logs folder found.")
+        self._open_first("crash_log_dirs", "logs")
 
     def open_crash_report_folder(self):
-        folder = getattr(self, "last_crash_report_folder", None)
-        if folder and Path(folder).exists():
-            try:
-                os.startfile(str(folder))
-            except Exception:
-                pass
+        folder = self.last_crash_report_folder or default_report_dir()
+        if Path(folder).is_dir():
+            open_folder(folder)
         else:
-            cf = self._selected_crash_file()
-            if cf:
-                report_dir = cf.path.parent / "StudioOneProjectTools_CrashReports"
-                report_dir.mkdir(exist_ok=True)
-                try:
-                    os.startfile(str(report_dir))
-                except Exception:
-                    pass
-
+            messagebox.showinfo("Crash Analyzer", f"No reports yet. They will be saved to:\n{folder}")
 
     def update_dashboard(self):
         total_plugins = len(self.plugins)

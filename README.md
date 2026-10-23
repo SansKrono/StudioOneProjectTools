@@ -1,103 +1,67 @@
 # Studio One Project Tools v2
 
-**Studio One Project Tools v2** is a beta-stable utility for safe cleanup, consolidation, recovery and crash diagnostics of Studio One / Fender Studio Pro projects.
+**Studio One Project Tools v2** is a Windows utility for cleaning up, consolidating, recovering and
+diagnosing Studio One / Fender Studio Pro projects, without overwriting the original `.song` file.
 
-## Core idea
-
-The tool helps create a clean autonomous copy of a Studio One project without overwriting the original `.song` file.
-
-It can collect referenced audio, recover missing files, identify unused and duplicate side files, create safe cleaned project copies, and analyze crash dumps without WinDbg or cdb.
-
-## Highlights
-
-- Clean autonomous project copy.
-- Fast missing audio search across connected drives through Everything / `es.exe`.
-- Relinked `.song` copy creation.
-- Safe no-bypassed-FX project copy.
-- Plugin scanning by tracks and FX slots.
-- Detection of unused files and duplicate side files.
-- Batch consolidate for multiple projects.
-- Built-in Crash Analyzer without WinDbg/cdb.
-- Minidump parser, stack memory scan, score/rank evidence.
-- Clear Everything test result.
+It can collect referenced audio into a self-contained project folder, find and relink missing files,
+spot unused and duplicate audio, write a copy of a project without bypassed FX, and analyze crash dumps
+with a built-in, read-only minidump parser.
 
 ## Features
 
-### Project cleanup and consolidation
+### Consolidation
 
-- Create a clean autonomous project copy.
-- Copy referenced audio into a new project folder.
-- Recover missing audio into a new relinked `.song` copy.
-- Keep the original project untouched.
-- Copy unused and duplicate side files into separate folders.
-- Prepare projects for transfer, backup, archiving or delivery.
+- Creates a new `<Song>_CONSOLIDATED` folder; the original project is untouched.
+- Copies audio inside the project with its folder structure, so references stay valid.
+- Copies external audio into `External\` and recovered missing audio into `Media\`, and relinks both.
+- Optionally copies unused and duplicate side files into `_Unused\` and `_Duplicates\`.
+- Re-reads the new `.song` afterwards and reports any reference that is still broken.
+- **Batch Consolidate** processes many projects in one run and can skip autosaves/backups.
 
 ### Missing file recovery
 
-- Uses Everything / `es.exe` for fast search across connected drives.
-- `es.exe` is detected automatically when bundled next to the app.
-- Test button checks the standard compatible Everything interface.
-- Test is neutral and does not depend on WAV/SONG files existing in the user index.
+- Searches all indexed drives through [Everything](https://www.voidtools.com/) / `es.exe`.
+- Only *safe* matches are used: one candidate, or several identical copies (same size + quick hash).
+- Writes a new relinked `.song` copy and a relink report.
 
-### Plugin tools
+### Plugins
 
-- Parse plugins by track and FX slot.
-- Detect bypassed FX.
-- Create a separate no-bypassed-FX `.song` copy.
-- Keep original `.song` safe.
+- Lists FX by track and slot, with search, filters and bypassed-FX view.
+- Remove, bypass or unbypass selected FX, or drop every bypassed FX, in a new `.song` copy.
 
-### Audio / file analysis
+### Audio / files
 
-- Referenced files.
-- Missing files.
-- Duplicate candidates.
-- Unused side files.
-- Project-side files that are not referenced by the `.song`.
-
-### Batch consolidate
-
-- Scan a folder with multiple `.song` projects.
-- Ignore autosaves/backups.
-- Consolidate multiple projects one by one.
-- Show progress and reports.
+- Shows referenced, external, missing, duplicate and unused audio.
+- Moves unused or duplicate side files out of the project after confirmation. Files the project
+  references are never moved by the duplicate cleanup.
 
 ### Crash Analyzer
 
-Built-in crash analysis without WinDbg/cdb:
+- Reads `.dmp`/`.mdmp` minidumps directly: exception, module list, thread stacks.
+- Finds the fault surface module and scans saved stacks for module addresses.
+- Matches project FX only against stack evidence (loaded is not evidence).
+- `score=` for project FX matches, `rank=` for any non-system module; the strongest are highlighted.
 
-- Reads Studio One / Fender Studio Pro minidumps.
-- Detects exception code and fault surface module.
-- Scans stack memory for module evidence.
-- Matches project FX only through stack evidence.
-- Uses `score=` for project FX matches.
-- Uses `rank=` for generic non-system modules.
-- Highlights strongest score/rank evidence.
+See [docs/MANUAL.md](docs/MANUAL.md) for details.
 
 ## Safety model
 
-The tool is designed around safe copies:
+- The original `.song` is never overwritten; writing over it is refused in code.
+- Edited `.song` copies are written to a temporary file first, then moved into place.
+- Consolidation only copies; it never moves or deletes source files.
+- Actions that change the original project folder (restoring missing files into `Media\`,
+  moving files) ask for confirmation first.
+- No network access, telemetry or auto-update. The only external program the app runs is `es.exe`,
+  found in trusted locations only (configured absolute path, app folder, absolute `PATH` entries,
+  `Program Files\Everything`), never from the current working folder.
 
-- original `.song` is not overwritten;
-- cleanup creates separate `.song` copies;
-- recovery creates relinked copies;
-- consolidation creates a new autonomous folder;
-- reports are written separately.
+See [AUDIT.md](AUDIT.md) for the security and behaviour review of this fork.
 
 ## Requirements
 
-Development:
-
-```bash
-python 3.11+
-pip install -r requirements.txt
-```
-
-Runtime:
-
 - Windows
-- Studio One / Fender Studio Pro projects
-- Everything installed and running for missing-file search
-- optional `es.exe` placed next to the app or selected in Settings
+- Python 3.11+ (to run from source; the app uses only the standard library)
+- [Everything](https://www.voidtools.com/) running, plus `es.exe`, for missing-file search
 
 ## Run from source
 
@@ -105,32 +69,25 @@ Runtime:
 python main.py
 ```
 
-## Build Windows EXE
+## Run the tests
 
-On Windows:
+```bash
+python -m unittest discover -s tests -v
+```
+
+## Build the Windows EXE
 
 ```bat
 BUILD_WINDOWS_EXE.bat
 ```
 
-Output:
+Output: `dist\StudioOneProjectTools\StudioOneProjectTools.exe`. See [WINDOWS_BUILD.md](WINDOWS_BUILD.md).
 
-```text
-dist\StudioOneProjectTools\StudioOneProjectTools.exe
-```
+## About es.exe
 
-For beta-stable, the onedir build is preferred because `es.exe` can stay next to the main EXE and be detected reliably.
-
-## Documentation
-
-- `docs/MANUAL_RU_EN.pdf`
-- `docs/MANUAL_RU_EN.docx`
-- `docs/PROMO_RU_EN.txt`
-
-## Notes about es.exe
-
-`es.exe` is a third-party Everything command-line tool. This source repository does not include it by default. If you want to distribute a bundled release, verify and follow the third-party license terms.
+`es.exe` is the third-party command-line client for Everything. It is not included in this repository.
+If you distribute it with a build, check and follow its license terms.
 
 ## Status
 
-Beta Stable RC1.
+Beta Stable RC2.

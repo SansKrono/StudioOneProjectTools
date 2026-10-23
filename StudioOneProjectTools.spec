@@ -1,39 +1,34 @@
 # -*- mode: python ; coding: utf-8 -*-
+# PyInstaller spec for the Windows onedir build. Run via BUILD_WINDOWS_EXE.bat.
 
 from pathlib import Path
 
-block_cipher = None
-
 project_root = Path.cwd()
+
+datas = [
+    ('README.md', '.'),
+    ('VERSION.txt', '.'),
+]
+
+# es.exe (Everything command-line client) is third-party and not part of this
+# repository. It is bundled only if you placed it in the project root yourself.
+if (project_root / 'es.exe').is_file():
+    datas.append(('es.exe', '.'))
 
 a = Analysis(
     ['main.py'],
     pathex=[str(project_root)],
     binaries=[],
-    datas=[
-        ('es.exe', '.'),
-        ('README.md', '.'),
-        ('VERSION.txt', '.'),
-    ],
-    hiddenimports=[
-        'tkinter',
-        'tkinter.ttk',
-        'tkinter.filedialog',
-        'tkinter.messagebox',
-        'zipfile',
-        'xml.etree.ElementTree',
-    ],
+    datas=datas,
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
@@ -44,7 +39,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX-packed executables are a common antivirus false-positive trigger.
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -57,10 +53,8 @@ exe = EXE(
 coll = COLLECT(
     exe,
     a.binaries,
-    a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
-    upx_exclude=[],
+    upx=False,
     name='StudioOneProjectTools',
 )

@@ -1,7 +1,7 @@
 from pathlib import Path
 import csv
 from datetime import datetime
-from core.audio_manager import format_size
+from core.common import format_bytes as format_size
 
 
 def generate_txt_report(song_path: Path | None, plugins, audio_rows) -> str:
@@ -68,34 +68,32 @@ def export_txt_report(output_path: Path, song_path: Path | None, plugins, audio_
     return output_path
 
 
+def _csv_cell(value):
+    """Prefix text that a spreadsheet would run as a formula (CSV injection)."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 def export_csv_report(output_path: Path, song_path: Path | None, plugins, audio_rows) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    rows = [
+        ["Studio One Project Tools Report"],
+        ["Project", str(song_path) if song_path else "Not loaded"],
+        [],
+        ["Section", "Track/Status", "Slot/Size", "Name/File", "Path/Reference"],
+    ]
+    rows += [
+        ["PLUGIN", p.track_name, p.slot_name, p.plugin_name, "BYPASSED" if p.bypassed else "ACTIVE"]
+        for p in plugins
+    ]
+    rows += [
+        ["AUDIO", a.status, a.size if a.size is not None else "", a.filename, str(a.path) if a.path else (a.reference or "")]
+        for a in audio_rows
+    ]
+
     with output_path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-
-        writer.writerow(["Studio One Project Tools Report"])
-        writer.writerow(["Project", str(song_path) if song_path else "Not loaded"])
-        writer.writerow([])
-
-        writer.writerow(["Section", "Track/Status", "Slot/Size", "Name/File", "Path/Reference"])
-
-        for p in plugins:
-            writer.writerow([
-                "PLUGIN",
-                p.track_name,
-                p.slot_name,
-                p.plugin_name,
-                "BYPASSED" if p.bypassed else "ACTIVE",
-            ])
-
-        for a in audio_rows:
-            writer.writerow([
-                "AUDIO",
-                a.status,
-                a.size if a.size is not None else "",
-                a.filename,
-                str(a.path) if a.path else (a.reference or ""),
-            ])
+        csv.writer(f).writerows([_csv_cell(v) for v in row] for row in rows)
 
     return output_path

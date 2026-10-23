@@ -1,9 +1,20 @@
+"""
+Minimal, read-only Windows minidump (.dmp/.mdmp) parser.
+
+Reads the exception, module list, thread stacks, system info and misc info
+streams directly from the file. No debugger, symbols or network access is used.
+"""
+
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-import struct
+import mmap
 import re
+import struct
+import sys
 
 
 THREAD_LIST_STREAM = 3
@@ -11,6 +22,12 @@ MODULE_LIST_STREAM = 4
 EXCEPTION_STREAM = 6
 SYSTEM_INFO_STREAM = 7
 MISC_INFO_STREAM = 15
+
+MODULE_ENTRY_SIZE = 108  # MINIDUMP_MODULE
+THREAD_ENTRY_SIZE = 48   # MINIDUMP_THREAD
+
+# Max distinct (module, offset) stack hits kept per thread.
+MAX_HITS_PER_THREAD = 1000
 
 EXCEPTION_NAMES = {
     0x80000003: "BREAKPOINT",
@@ -65,13 +82,6 @@ class MiniException:
 
 
 @dataclass
-class MiniThreadStack:
-    thread_id: int
-    start: int
-    data: bytes
-
-
-@dataclass
 class StackModuleHit:
     thread_id: int
     stack_offset: int
@@ -91,33 +101,32 @@ class MiniDumpReport:
     modules: list[MiniModule] = field(default_factory=list)
     faulting_module: MiniModule | None = None
     fault_module_offset: int | None = None
-    suspicious_modules: list[MiniModule] = field(default_factory=list)
-    thread_stacks: list[MiniThreadStack] = field(default_factory=list)
     exception_thread_stack_hits: list[StackModuleHit] = field(default_factory=list)
     all_stack_hits: list[StackModuleHit] = field(default_factory=list)
 
 
-def _u32(data: bytes, off: int) -> int:
+# ---------------------------------------------------------------------------
+# Low-level stream parsing
+# ---------------------------------------------------------------------------
+
+def _u32(data, off: int) -> int:
     return struct.unpack_from("<I", data, off)[0]
 
 
-def _u64(data: bytes, off: int) -> int:
+def _u64(data, off: int) -> int:
     return struct.unpack_from("<Q", data, off)[0]
 
 
-def _read_utf16_string(data: bytes, rva: int) -> str:
+def _read_utf16_string(data, rva: int) -> str:
     if not rva or rva + 4 > len(data):
         return ""
-    try:
-        byte_len = _u32(data, rva)
-        start = rva + 4
-        end = min(start + byte_len, len(data))
-        return data[start:end].decode("utf-16-le", errors="replace").rstrip("\x00")
-    except Exception:
-        return ""
+    byte_len = _u32(data, rva)
+    start = rva + 4
+    end = min(start + byte_len, len(data))
+    return bytes(data[start:end]).decode("utf-16-le", errors="replace").rstrip("\x00")
 
 
-def _stream_dirs(data: bytes) -> dict[int, tuple[int, int]]:
+def _stream_dirs(data) -> dict[int, tuple[int, int]]:
     if len(data) < 32:
         raise ValueError("File is too small for MINIDUMP_HEADER")
     if data[:4] != b"MDMP":
@@ -131,307 +140,201 @@ def _stream_dirs(data: bytes) -> dict[int, tuple[int, int]]:
     streams: dict[int, tuple[int, int]] = {}
     for i in range(stream_count):
         off = dir_rva + i * 12
-        stream_type = _u32(data, off)
-        size = _u32(data, off + 4)
-        rva = _u32(data, off + 8)
+        stream_type, size, rva = struct.unpack_from("<III", data, off)
         if rva and size and rva + size <= len(data):
             streams[stream_type] = (rva, size)
     return streams
 
 
-def _parse_system_info(data: bytes, streams: dict[int, tuple[int, int]]) -> str:
+def _parse_system_info(data, streams) -> str:
     loc = streams.get(SYSTEM_INFO_STREAM)
-    if not loc:
+    if not loc or loc[1] < 2:
         return ""
-    rva, size = loc
-    if size < 2:
-        return ""
-    arch = struct.unpack_from("<H", data, rva)[0]
-    return {
-        0: "x86",
-        5: "ARM",
-        6: "IA64",
-        9: "x64 / AMD64",
-        12: "ARM64",
-    }.get(arch, f"unknown ({arch})")
+    arch = struct.unpack_from("<H", data, loc[0])[0]
+    return {0: "x86", 5: "ARM", 6: "IA64", 9: "x64 / AMD64", 12: "ARM64"}.get(arch, f"unknown ({arch})")
 
 
-def _parse_misc_info(data: bytes, streams: dict[int, tuple[int, int]]) -> int:
+def _parse_misc_info(data, streams) -> int:
     loc = streams.get(MISC_INFO_STREAM)
-    if not loc:
+    if not loc or loc[1] < 12:
         return 0
-    rva, size = loc
-    if size >= 12:
-        try:
-            flags = _u32(data, rva + 4)
-            if flags & 0x00000001:
-                return _u32(data, rva + 8)
-        except Exception:
-            pass
-    return 0
+    rva = loc[0]
+    flags = _u32(data, rva + 4)
+    return _u32(data, rva + 8) if flags & 0x1 else 0
 
 
-def _parse_exception(data: bytes, streams: dict[int, tuple[int, int]]) -> MiniException | None:
+def _parse_exception(data, streams) -> MiniException | None:
     loc = streams.get(EXCEPTION_STREAM)
-    if not loc:
+    if not loc or loc[1] < 8 + 32:
         return None
-    rva, size = loc
-    if size < 8 + 32:
-        return None
-    try:
-        thread_id = _u32(data, rva)
-        ex = rva + 8
-        code = _u32(data, ex)
-        flags = _u32(data, ex + 4)
-        record = _u64(data, ex + 8)
-        address = _u64(data, ex + 16)
-        nparams = min(max(_u32(data, ex + 24), 0), 15)
-        params = []
-        param_base = ex + 32
-        for i in range(nparams):
-            poff = param_base + i * 8
-            if poff + 8 <= len(data):
-                params.append(_u64(data, poff))
-        return MiniException(thread_id, code, flags, record, address, params)
-    except Exception:
-        return None
+    rva = loc[0]
+    thread_id = _u32(data, rva)
+    ex = rva + 8
+    code, flags = _u32(data, ex), _u32(data, ex + 4)
+    record, address = _u64(data, ex + 8), _u64(data, ex + 16)
+    nparams = min(_u32(data, ex + 24), 15)
+    params = [_u64(data, ex + 32 + i * 8) for i in range(nparams) if ex + 40 + i * 8 <= len(data)]
+    return MiniException(thread_id, code, flags, record, address, params)
 
 
-def _parse_modules(data: bytes, streams: dict[int, tuple[int, int]]) -> list[MiniModule]:
+def _parse_modules(data, streams) -> list[MiniModule]:
     loc = streams.get(MODULE_LIST_STREAM)
-    if not loc:
-        return []
-    rva, size = loc
-    if size < 4:
-        return []
-
-    try:
-        count = _u32(data, rva)
-    except Exception:
+    if not loc or loc[1] < 4:
         return []
 
     modules: list[MiniModule] = []
-    off = rva + 4
-    entry_size = 108
-
-    for _ in range(count):
-        if off + entry_size > len(data):
+    off = loc[0] + 4
+    for _ in range(_u32(data, loc[0])):
+        if off + MODULE_ENTRY_SIZE > len(data):
             break
-        try:
-            base = _u64(data, off + 0)
-            img_size = _u32(data, off + 8)
-            checksum = _u32(data, off + 12)
-            timestamp = _u32(data, off + 16)
-            name_rva = _u32(data, off + 20)
-            name = _read_utf16_string(data, name_rva)
-            modules.append(MiniModule(base=base, size=img_size, checksum=checksum, timestamp=timestamp, name=name))
-        except Exception:
-            pass
-        off += entry_size
+        base, img_size, checksum, timestamp, name_rva = struct.unpack_from("<QIIII", data, off)
+        modules.append(MiniModule(base, img_size, checksum, timestamp, _read_utf16_string(data, name_rva)))
+        off += MODULE_ENTRY_SIZE
 
     modules.sort(key=lambda m: m.base)
     return modules
 
 
-def _classify_suspicious(modules: list[MiniModule]) -> list[MiniModule]:
-    # Generic relevance only. No vendor list.
-    categories = {"plugin-path", "audio-driver", "licensing", "graphics", "host", "non-system"}
-    return [m for m in modules if classify_module(m.name) in categories]
-
-
-
-def _parse_thread_stacks(data: bytes, streams: dict[int, tuple[int, int]]) -> list[MiniThreadStack]:
+def _iter_thread_stacks(data, streams):
+    """Yield (thread_id, stack bytes) for each thread with captured stack memory."""
     loc = streams.get(THREAD_LIST_STREAM)
-    if not loc:
-        return []
-    rva, size = loc
-    if size < 4:
-        return []
+    if not loc or loc[1] < 4:
+        return
 
-    try:
-        count = _u32(data, rva)
-    except Exception:
-        return []
-
-    stacks: list[MiniThreadStack] = []
-    off = rva + 4
-    entry_size = 48  # MINIDUMP_THREAD
-
-    for _ in range(count):
-        if off + entry_size > len(data):
+    off = loc[0] + 4
+    for _ in range(_u32(data, loc[0])):
+        if off + THREAD_ENTRY_SIZE > len(data):
             break
-        try:
-            thread_id = _u32(data, off + 0)
-
-            # MINIDUMP_THREAD:
-            # ULONG32 ThreadId;
-            # ULONG32 SuspendCount;
-            # ULONG32 PriorityClass;
-            # ULONG32 Priority;
-            # ULONG64 Teb;
-            # MINIDUMP_MEMORY_DESCRIPTOR Stack;
-            # MINIDUMP_LOCATION_DESCRIPTOR ThreadContext;
-            # Stack starts at offset +24:
-            #   StartOfMemoryRange ULONG64
-            #   Memory.DataSize ULONG32
-            #   Memory.Rva ULONG32
-            stack_start = _u64(data, off + 24)
-            stack_size = _u32(data, off + 32)
-            stack_rva = _u32(data, off + 36)
-
-            if stack_start and stack_size and stack_rva and stack_rva + stack_size <= len(data):
-                stacks.append(MiniThreadStack(thread_id=thread_id, start=stack_start, data=data[stack_rva:stack_rva + stack_size]))
-        except Exception:
-            pass
-        off += entry_size
-
-    return stacks
+        # MINIDUMP_THREAD: ThreadId, SuspendCount, PriorityClass, Priority (4x u32), Teb (u64),
+        # then Stack = MINIDUMP_MEMORY_DESCRIPTOR { StartOfMemoryRange u64, DataSize u32, Rva u32 }.
+        thread_id = _u32(data, off)
+        stack_start, stack_size, stack_rva = struct.unpack_from("<QII", data, off + 24)
+        if stack_start and stack_size and stack_rva and stack_rva + stack_size <= len(data):
+            yield thread_id, data[stack_rva:stack_rva + stack_size]
+        off += THREAD_ENTRY_SIZE
 
 
-def _module_for_address(modules: list[MiniModule], address: int) -> MiniModule | None:
-    # Linear scan is fine for typical minidumps. Module list is usually small.
-    for m in modules:
-        if m.contains(address):
-            return m
-    return None
+# ---------------------------------------------------------------------------
+# Stack scanning
+# ---------------------------------------------------------------------------
+
+class _ModuleIndex:
+    """Address -> module lookup via binary search over sorted module bases."""
+
+    def __init__(self, modules: list[MiniModule]):
+        self.modules = [m for m in modules if m.size]
+        self.bases = [m.base for m in self.modules]
+        self.lo = self.bases[0] if self.bases else 0
+        self.hi = max((m.end for m in self.modules), default=0)
+
+    def find(self, address: int) -> MiniModule | None:
+        if not (self.lo <= address < self.hi):
+            return None
+        i = bisect_right(self.bases, address) - 1
+        if i >= 0 and self.modules[i].contains(address):
+            return self.modules[i]
+        return None
 
 
-def _scan_stack_for_module_addresses(stacks: list[MiniThreadStack], modules: list[MiniModule]) -> list[StackModuleHit]:
+def _scan_stack(thread_id: int, stack: bytes, index: _ModuleIndex) -> list[StackModuleHit]:
     """
     Heuristic stack scanner.
 
-    It scans every aligned 8-byte value in saved thread stacks.
-    If a value points inside a loaded module range, it is treated as a possible
-    return address / saved pointer to code. This is not as precise as a symbolic
-    call stack, but it can reveal plugin/DLL involvement when the exception
-    address itself is only kernelbase/ucrtbase.
+    Every aligned 8-byte value in a saved thread stack that points inside a loaded
+    module is treated as a possible return address. This is less precise than a
+    symbolic call stack, but it can reveal plugin/DLL involvement when the
+    exception address itself is only in kernelbase/ucrtbase.
+    Distinct (module, offset) pairs are kept, up to MAX_HITS_PER_THREAD per thread.
     """
+    usable = len(stack) - len(stack) % 8
+    if usable <= 0:
+        return []
+
+    lo, hi = max(index.lo, 0x10000), min(index.hi, 0x00007FFFFFFFFFFF + 1)
     hits: list[StackModuleHit] = []
+    seen: set[tuple[str, int]] = set()
 
-    for st in stacks:
-        data = st.data
-        max_len = len(data) - 8
-        if max_len < 0:
+    if sys.byteorder == "little":
+        values = memoryview(stack)[:usable].cast("Q")
+    else:
+        values = (v for (v,) in struct.iter_unpack("<Q", stack[:usable]))
+
+    for slot, value in enumerate(values):
+        if value < lo or value >= hi:
             continue
-
-        # Step 8 for x64. Studio One / Fender Studio Pro is x64 in practice.
-        for pos in range(0, max_len + 1, 8):
-            try:
-                value = struct.unpack_from("<Q", data, pos)[0]
-            except Exception:
-                continue
-
-            # User-mode canonical-ish range filter to reduce noise.
-            if value < 0x10000 or value > 0x00007FFFFFFFFFFF:
-                continue
-
-            mod = _module_for_address(modules, value)
-            if mod:
-                hits.append(StackModuleHit(
-                    thread_id=st.thread_id,
-                    stack_offset=pos,
-                    address=value,
-                    module=mod,
-                    module_offset=value - mod.base,
-                ))
+        mod = index.find(value)
+        if mod is None:
+            continue
+        key = (mod.name.lower(), value - mod.base)
+        if key in seen:
+            continue
+        seen.add(key)
+        hits.append(StackModuleHit(thread_id, slot * 8, value, mod, value - mod.base))
+        if len(hits) >= MAX_HITS_PER_THREAD:
+            break
 
     return hits
 
 
-def _dedupe_stack_hits(hits: list[StackModuleHit], limit: int = 300) -> list[StackModuleHit]:
-    seen = set()
-    out = []
-    for h in hits:
-        key = (h.thread_id, h.module.name.lower(), h.module_offset)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(h)
-        if len(out) >= limit:
-            break
-    return out
-
-
 def _rank_modules_from_stack_hits(hits: list[StackModuleHit]) -> list[tuple[MiniModule, int]]:
-    counts: dict[str, tuple[MiniModule, int]] = {}
+    counts: dict[str, list] = {}
     for h in hits:
-        key = h.module.name.lower()
-        if key not in counts:
-            counts[key] = (h.module, 0)
-        counts[key] = (counts[key][0], counts[key][1] + 1)
-    ranked = sorted(counts.values(), key=lambda x: x[1], reverse=True)
-    return ranked
+        entry = counts.setdefault(h.module.name.lower(), [h.module, 0])
+        entry[1] += 1
+    return sorted(((m, c) for m, c in counts.values()), key=lambda x: x[1], reverse=True)
 
+
+# ---------------------------------------------------------------------------
+# Module classification
+# ---------------------------------------------------------------------------
+
+_RUNTIME_EXACT = {
+    "kernelbase.dll", "kernel32.dll", "ntdll.dll", "user32.dll", "win32u.dll",
+    "gdi32.dll", "gdi32full.dll", "combase.dll", "rpcrt4.dll", "ole32.dll",
+    "shell32.dll", "advapi32.dll", "sechost.dll", "bcrypt.dll", "bcryptprimitives.dll",
+    "ws2_32.dll", "winmm.dll", "mmdevapi.dll", "cfgmgr32.dll", "setupapi.dll",
+}
+_RUNTIME_PREFIXES = ("ucrt", "vcruntime", "msvcp", "concrt")
+_PLUGIN_PATH_MARKERS = (
+    "\\common files\\vst3\\", "\\vstplugins\\", "\\steinberg\\vstplugins\\", "\\common files\\clap\\",
+    "\\audio\\plug-ins\\", "\\plugins\\vst\\", "\\plugins\\vst3\\",
+    ".vst3\\", ".vst\\", ".clap\\", ".aaxplugin\\", ".component\\",
+)
+_LICENSING_MARKERS = ("pace", "ilok", "license", "licence", "activation", "codemeter", "wibu")
+_GRAPHICS_MARKERS = ("nvoglv", "nvwgf", "nvcuda", "atidxx", "amdxx", "d3d", "dxgi", "vulkan", "opengl", "igc", "igd")
 
 
 def normalize_module_path(name: str) -> str:
     return (name or "").replace("/", "\\").lower()
 
 
+@lru_cache(maxsize=4096)
 def classify_module(name: str) -> str:
     """
-    Generic classification only. No vendor/brand guesses.
-
-    Categories:
-    - system/runtime
-    - host
-    - plugin-path
-    - audio-driver
-    - licensing
-    - graphics
-    - non-system
+    Generic classification only, no vendor guesses:
+    system/runtime, system, host, plugin-path, audio-driver, licensing, graphics, non-system, unknown.
     """
     n = normalize_module_path(name)
-
     if not n:
         return "unknown"
 
+    base = n.rsplit("\\", 1)[-1]
+
     if "\\windows\\system32\\" in n or "\\windows\\syswow64\\" in n:
-        base = n.rsplit("\\", 1)[-1]
-        runtime_prefixes = ("ucrt", "vcruntime", "msvcp", "concrt")
-        runtime_exact = {
-            "kernelbase.dll", "kernel32.dll", "ntdll.dll", "user32.dll", "win32u.dll",
-            "gdi32.dll", "gdi32full.dll", "combase.dll", "rpcrt4.dll", "ole32.dll",
-            "shell32.dll", "advapi32.dll", "sechost.dll", "bcrypt.dll", "bcryptprimitives.dll",
-            "ws2_32.dll", "winmm.dll", "mmdevapi.dll", "cfgmgr32.dll", "setupapi.dll",
-        }
-        if base in runtime_exact or base.startswith(runtime_prefixes):
+        if base in _RUNTIME_EXACT or base.startswith(_RUNTIME_PREFIXES):
             return "system/runtime"
         return "system"
 
-    base = n.rsplit("\\", 1)[-1]
-
     if base in {"studio one.exe", "studio pro.exe", "studioone.exe"} or "studio one" in base or "studio pro" in base:
         return "host"
-
-    plugin_path_markers = (
-        "\\common files\\vst3\\",
-        "\\vstplugins\\",
-        "\\steinberg\\vstplugins\\",
-        "\\common files\\clap\\",
-        "\\audio\\plug-ins\\",
-        "\\plugins\\vst\\",
-        "\\plugins\\vst3\\",
-        ".vst3\\",
-        ".vst\\",
-        ".clap\\",
-        ".aaxplugin\\",
-        ".component\\",
-    )
-    if any(x in n for x in plugin_path_markers):
+    if any(x in n for x in _PLUGIN_PATH_MARKERS):
         return "plugin-path"
-
     if "asio" in base or "\\asio\\" in n or "wasapi" in base:
         return "audio-driver"
-
-    licensing_markers = ("pace", "ilok", "license", "licence", "activation", "codemeter", "wibu")
-    if any(x in n for x in licensing_markers):
+    if any(x in n for x in _LICENSING_MARKERS):
         return "licensing"
-
-    graphics_markers = ("nvoglv", "nvwgf", "nvcuda", "atidxx", "amdxx", "d3d", "dxgi", "vulkan", "opengl", "igc", "igd")
-    if any(x in base for x in graphics_markers):
+    if any(x in base for x in _GRAPHICS_MARKERS):
         return "graphics"
-
     return "non-system"
 
 
@@ -443,114 +346,90 @@ def is_plugin_path_module(name: str) -> bool:
     return classify_module(name) == "plugin-path"
 
 
-def _is_system_noise_module(name: str) -> bool:
-    return classify_module(name) in {"system/runtime", "system"}
-
-
-def _rank_modules_from_stack_hits(hits: list[StackModuleHit]) -> list[tuple[MiniModule, int]]:
-    counts: dict[str, tuple[MiniModule, int]] = {}
-    for h in hits:
-        key = h.module.name.lower()
-        if key not in counts:
-            counts[key] = (h.module, 0)
-        counts[key] = (counts[key][0], counts[key][1] + 1)
-    ranked = sorted(counts.values(), key=lambda x: x[1], reverse=True)
-    return ranked
-
-
-def _modules_by_category(modules: list[MiniModule], category: str) -> list[MiniModule]:
-    return [m for m in modules if classify_module(m.name) == category]
-
-
-def _interesting_stack_modules(hits: list[StackModuleHit]) -> list[tuple[MiniModule, int]]:
-    ranked = _rank_modules_from_stack_hits(hits)
-    return [(m, c) for m, c in ranked if not _is_system_noise_module(m.name)]
-
-
 def _format_module_line(m: MiniModule) -> str:
     return f"[{classify_module(m.name)}] 0x{m.base:016X}-0x{m.end:016X}  {m.name}"
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def analyze_minidump(path: str | Path) -> MiniDumpReport:
     path = Path(path)
     report = MiniDumpReport(path=path)
     try:
-        data = path.read_bytes()
-        streams = _stream_dirs(data)
-        report.valid = True
-        report.processor_arch = _parse_system_info(data, streams)
-        report.process_id = _parse_misc_info(data, streams)
-        report.exception = _parse_exception(data, streams)
-        report.modules = _parse_modules(data, streams)
-        report.thread_stacks = _parse_thread_stacks(data, streams)
+        with path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            streams = _stream_dirs(data)
+            report.valid = True
+            report.processor_arch = _parse_system_info(data, streams)
+            report.process_id = _parse_misc_info(data, streams)
+            report.exception = _parse_exception(data, streams)
+            report.modules = _parse_modules(data, streams)
 
-        if report.exception:
-            addr = report.exception.address
-            for m in report.modules:
-                if m.contains(addr):
-                    report.faulting_module = m
-                    report.fault_module_offset = addr - m.base
-                    break
+            index = _ModuleIndex(report.modules)
+            if report.exception:
+                report.faulting_module = index.find(report.exception.address)
+                if report.faulting_module:
+                    report.fault_module_offset = report.exception.address - report.faulting_module.base
 
-        report.all_stack_hits = _dedupe_stack_hits(_scan_stack_for_module_addresses(report.thread_stacks, report.modules), limit=1000)
-
-        if report.exception:
-            report.exception_thread_stack_hits = [
-                h for h in report.all_stack_hits
-                if h.thread_id == report.exception.thread_id
-            ]
-
-        report.suspicious_modules = _classify_suspicious(report.modules)
-    except Exception as e:
+            for thread_id, stack in _iter_thread_stacks(data, streams):
+                report.all_stack_hits.extend(_scan_stack(thread_id, stack, index))
+    except (OSError, ValueError, struct.error) as e:
         report.error = str(e)
+
+    if report.exception:
+        tid = report.exception.thread_id
+        report.exception_thread_stack_hits = [h for h in report.all_stack_hits if h.thread_id == tid]
+
     return report
 
 
+# ---------------------------------------------------------------------------
+# Matching opened .song FX names against dump modules
+# ---------------------------------------------------------------------------
+
+_NOISE_TOKENS = {
+    "vst3", "vst", "clap", "aax", "aaxplugin", "dll", "exe", "x64", "x86", "64", "86", "win", "win64", "win32",
+    "plugin", "plugins", "common", "files", "program", "data", "steinberg", "contents", "mono", "stereo",
+}
+
 
 def _tokenize_for_match(text: str) -> set[str]:
-    """
-    Generic tokenization for matching project FX names against dump module paths.
-    No vendor hardcoding.
-    """
-    text = (text or "").lower()
-    text = text.replace("\\", " ").replace("/", " ")
-    text = re.sub(r"[\._\-\+\(\)\[\]\{\},;:]+", " ", text)
-    text = re.sub(r"\b(vst3|vst|clap|aax|dll|exe|x64|x86|win64|win32|plugin|plugins|common|files|program|data|steinberg|contents)\b", " ", text)
-    tokens = {t for t in text.split() if len(t) >= 3}
-    return tokens
+    text = re.sub(r"^[a-z]:", " ", (text or "").lower())  # drop the drive letter
+    return {t for t in re.split(r"[^a-z0-9]+", text) if t and t not in _NOISE_TOKENS}
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
 
 
 def _project_fx_match_score(project_name: str, module_name: str) -> tuple[int, list[str]]:
+    """
+    Score how well a project FX name matches a module path.
+
+    A match needs most (>= 75%) of the FX name's tokens to appear in the module
+    path, including at least one distinctive token of 3+ characters. This keeps
+    e.g. "Pro-C 2" from matching "Pro-Q 3.vst3" just because both contain "pro".
+    """
     p_tokens = _tokenize_for_match(project_name)
     m_tokens = _tokenize_for_match(module_name)
-
     if not p_tokens or not m_tokens:
         return 0, []
 
     common = sorted(p_tokens & m_tokens)
-    if not common:
-        # substring fallback for compact plugin names
-        p = re.sub(r"[^a-z0-9]+", "", project_name.lower())
-        m = re.sub(r"[^a-z0-9]+", "", module_name.lower())
-        if len(p) >= 4 and p in m:
+    coverage = len(common) / len(p_tokens)
+
+    if coverage < 0.75 or not any(len(t) >= 3 for t in common):
+        # Fallback for compact plugin names such as "ProQ3" vs "Pro-Q 3.vst3".
+        p = _compact(project_name)
+        base = module_name.replace("/", "\\").rsplit("\\", 1)[-1]
+        if len(p) >= 4 and p in _compact(base):
             return 100, [project_name]
         return 0, []
 
-    # Strong enough for practical FX-to-DLL matching.
-    score = len(common) * 20
-
-    # Boost when project name is mostly covered by module/path.
-    coverage = len(common) / max(len(p_tokens), 1)
-    if coverage >= 0.75:
-        score += 50
-    elif coverage >= 0.5:
-        score += 25
-
-    # Boost plugin-path modules because those are more likely actual FX binaries.
+    score = len(common) * 20 + (50 if coverage >= 0.75 else 25)
     if is_plugin_path_module(module_name):
         score += 35
-
     return score, common
 
 
@@ -565,31 +444,16 @@ def _collect_project_matches(
     """
     Match opened .song FX names against dump evidence.
 
-    Important rule:
-    loaded modules alone are NOT evidence of crash involvement.
-    Studio One can load many plugins from the project; showing all of them as
-    matches makes the report useless.
-
-    Evidence used by default:
-    - stack module hits only.
-
-    Loaded modules can be included only for a separate informational count,
-    not for the main culprit list.
+    Loaded modules alone are NOT evidence of crash involvement (Studio One loads
+    every plugin in the project), so by default only stack hits are used.
     """
     if not project_names:
         return []
 
-    evidence: list[tuple[str, MiniModule, int]] = []
-    for m, count in ranked_modules:
-        if count <= 0:
-            continue
-        evidence.append(("stack", m, count))
-
+    evidence: list[tuple[str, MiniModule, int]] = [("stack", m, c) for m, c in ranked_modules if c > 0]
     if include_loaded_only and loaded_modules:
         existing = {m.name.lower() for _, m, _ in evidence}
-        for m in loaded_modules:
-            if m.name.lower() not in existing:
-                evidence.append(("loaded", m, 0))
+        evidence += [("loaded", m, 0) for m in loaded_modules if m.name.lower() not in existing]
 
     matches = []
     for fx in project_names:
@@ -598,46 +462,17 @@ def _collect_project_matches(
             score, tokens = _project_fx_match_score(fx, mod.name)
             if score <= 0:
                 continue
-
-            if source == "stack":
-                score += 100 + min(hits, 75)
-            else:
-                # Loaded-only is weak and must never dominate.
-                score += 5
-
+            # Loaded-only presence is weak and must never dominate.
+            score += 100 + min(hits, 75) if source == "stack" else 5
             if score < min_score:
                 continue
-
-            item = {
-                "fx": fx,
-                "module": mod,
-                "source": source,
-                "hits": hits,
-                "score": score,
-                "tokens": tokens,
-            }
-            if best is None or item["score"] > best["score"]:
-                best = item
+            if best is None or score > best["score"]:
+                best = {"fx": fx, "module": mod, "source": source, "hits": hits, "score": score, "tokens": tokens}
         if best:
             matches.append(best)
 
     matches.sort(key=lambda x: x["score"], reverse=True)
     return matches
-
-
-def _loaded_project_fx_matches(project_names: list[str], loaded_modules: list[MiniModule]) -> list[dict]:
-    """
-    Informational only. Shows what project FX are simply loaded in the dump.
-    This is NOT used as crash evidence.
-    """
-    return _collect_project_matches(
-        project_names,
-        ranked_modules=[],
-        loaded_modules=loaded_modules,
-        include_loaded_only=True,
-        min_score=1,
-    )
-
 
 
 def _format_project_match(item: dict) -> str:
@@ -651,70 +486,34 @@ def _format_project_match(item: dict) -> str:
     )
 
 
+_CATEGORY_BASE_RANK = {
+    "plugin-path": 90, "audio-driver": 85, "licensing": 80, "graphics": 70,
+    "host": 55, "non-system": 50, "unknown": 30, "system/runtime": 5, "system": 5,
+}
+
 
 def module_rank(module: MiniModule, hits: int, *, exception_thread: bool = False) -> int:
-    """
-    Generic suspicion rank for any non-system module.
-
-    No vendor hardcoding.
-    Higher = more relevant.
-
-    Inputs:
-    - stack hit count;
-    - whether the module was in exception thread stack;
-    - generic category.
-    """
-    category = classify_module(module.name)
-
-    base = 0
-    if category == "plugin-path":
-        base = 90
-    elif category == "audio-driver":
-        base = 85
-    elif category == "licensing":
-        base = 80
-    elif category == "graphics":
-        base = 70
-    elif category == "host":
-        base = 55
-    elif category == "non-system":
-        base = 50
-    elif category == "unknown":
-        base = 30
-    elif category in {"system/runtime", "system"}:
-        base = 5
-
+    """Generic suspicion rank for any module: category + exception-thread bonus + capped hit count."""
+    rank = _CATEGORY_BASE_RANK.get(classify_module(module.name), 0)
     if exception_thread:
-        base += 60
-
-    # Hits matter, but cap them so a noisy stack does not dominate everything.
-    base += min(max(hits, 0), 100)
-
-    return base
+        rank += 60
+    return rank + min(max(hits, 0), 100)
 
 
-def _ranked_with_suspicion(
-    ranked: list[tuple[MiniModule, int]],
-    *,
-    exception_thread: bool = False,
-    include_system: bool = False,
-) -> list[tuple[MiniModule, int, int]]:
-    out = []
-    for m, hits in ranked:
-        if not include_system and is_system_or_runtime_module(m.name):
-            continue
-        rank = module_rank(m, hits, exception_thread=exception_thread)
-        out.append((m, hits, rank))
+def _ranked_with_suspicion(ranked, *, exception_thread: bool = False) -> list[tuple[MiniModule, int, int]]:
+    out = [(m, hits, module_rank(m, hits, exception_thread=exception_thread))
+           for m, hits in ranked if not is_system_or_runtime_module(m.name)]
     out.sort(key=lambda x: x[2], reverse=True)
     return out
 
 
 def format_minidump_report(report: MiniDumpReport, plugin_names: list[str] | None = None) -> str:
-    lines = []
-    lines.append("Studio One Project Tools - Project Crash Match Report")
-    lines.append("=" * 80)
-    lines.append(f"File: {report.path}")
-    lines.append(f"Valid minidump: {'yes' if report.valid else 'no'}")
+    lines = [
+        "Studio One Project Tools - Project Crash Match Report",
+        "=" * 80,
+        f"File: {report.path}",
+        f"Valid minidump: {'yes' if report.valid else 'no'}",
+    ]
     if report.error:
         lines.append(f"Error: {report.error}")
         return "\n".join(lines)
@@ -722,157 +521,97 @@ def format_minidump_report(report: MiniDumpReport, plugin_names: list[str] | Non
     lines.append(f"Processor: {report.processor_arch or 'unknown'}")
     if report.process_id:
         lines.append(f"Process ID: {report.process_id}")
-    lines.append("")
-
-    lines.append("Exception")
-    lines.append("-" * 80)
+    lines += ["", "Exception", "-" * 80]
     if report.exception:
         e = report.exception
-        lines.append(f"Thread ID: 0x{e.thread_id:X} ({e.thread_id})")
-        lines.append(f"Code:      0x{e.code:08X} {e.code_name}")
-        lines.append(f"Address:   0x{e.address:016X}")
+        lines += [f"Thread ID: 0x{e.thread_id:X} ({e.thread_id})", f"Code:      0x{e.code:08X} {e.code_name}",
+                  f"Address:   0x{e.address:016X}"]
     else:
         lines.append("No ExceptionStream found in this dump.")
-    lines.append("")
-
-    lines.append("Fault surface module")
-    lines.append("-" * 80)
+    lines += ["", "Fault surface module", "-" * 80]
     if report.faulting_module:
         m = report.faulting_module
         lines.append(_format_module_line(m))
         if report.fault_module_offset is not None:
             lines.append(f"Offset: +0x{report.fault_module_offset:X}")
-        if classify_module(m.name) in {"system/runtime", "system"}:
-            lines.append("Note: system/runtime surface module; real caller can be lower in stack.")
+        if is_system_or_runtime_module(m.name):
+            lines.append("Note: system/runtime surface module; the real caller can be lower in the stack.")
     else:
         lines.append("Not resolved by exception address.")
     lines.append("")
 
-    exception_hits = report.exception_thread_stack_hits or []
-    all_hits = report.all_stack_hits or []
+    def non_system(hits):
+        return [(m, c) for m, c in _rank_modules_from_stack_hits(hits) if not is_system_or_runtime_module(m.name)]
 
-    exception_ranked = _rank_modules_from_stack_hits(exception_hits)
-    exception_non_system = [(m, c) for m, c in exception_ranked if not is_system_or_runtime_module(m.name)]
+    exception_non_system = non_system(report.exception_thread_stack_hits)
     exception_plugin = [(m, c) for m, c in exception_non_system if is_plugin_path_module(m.name)]
-
-    all_ranked = _rank_modules_from_stack_hits(all_hits)
-    all_non_system = [(m, c) for m, c in all_ranked if not is_system_or_runtime_module(m.name)]
+    all_non_system = non_system(report.all_stack_hits)
     all_plugin = [(m, c) for m, c in all_non_system if is_plugin_path_module(m.name)]
 
     plugin_names = plugin_names or []
-    project_matches_exception = _collect_project_matches(
-        plugin_names,
-        exception_non_system,
-        [],
-        include_loaded_only=False,
-        min_score=120,
-    )
-    project_matches_all = _collect_project_matches(
-        plugin_names,
-        all_non_system,
-        [],
-        include_loaded_only=False,
-        min_score=120,
-    )
-    loaded_only_project_matches = _loaded_project_fx_matches(plugin_names, report.modules)
+    matches_exception = _collect_project_matches(plugin_names, exception_non_system)
+    matches_all = _collect_project_matches(plugin_names, all_non_system)
+    loaded_only = _collect_project_matches(plugin_names, [], report.modules, include_loaded_only=True, min_score=1)
 
-    lines.append("Project FX matched in EXCEPTION THREAD stack (strong evidence)")
-    lines.append("-" * 80)
-    if plugin_names:
-        if project_matches_exception:
-            for idx, item in enumerate(project_matches_exception[:25], 1):
-                lines.append(f"{idx:02}. {_format_project_match(item)}")
-            if len(project_matches_exception) > 25:
-                lines.append(f"... {len(project_matches_exception) - 25} more hidden")
-        else:
-            lines.append("No opened .song FX matched inside exception-thread stack modules.")
-    else:
-        lines.append("Project context not loaded. Open a .song first to match dump modules against project FX.")
-    lines.append("")
-
-    lines.append("Project FX matched in ALL THREAD stacks (supporting evidence)")
-    lines.append("-" * 80)
-    if plugin_names:
-        if project_matches_all:
-            for idx, item in enumerate(project_matches_all[:35], 1):
-                lines.append(f"{idx:02}. {_format_project_match(item)}")
-            if len(project_matches_all) > 35:
-                lines.append(f"... {len(project_matches_all) - 35} more hidden")
-        else:
-            lines.append("No opened .song FX matched in all-thread stack modules.")
-    else:
-        lines.append("Project context not loaded.")
-    lines.append("")
-
-    def append_ranked(title: str, ranked: list[tuple[MiniModule, int]], limit: int, empty: str, *, exception_thread: bool = False):
-        lines.append(title)
-        lines.append("-" * 80)
-        if ranked:
-            ranked3 = _ranked_with_suspicion(ranked, exception_thread=exception_thread, include_system=False)
-            for idx, (m, count, rank) in enumerate(ranked3[:limit], 1):
-                lines.append(f"{idx:02}. rank={rank:3} hits={count:3}  {_format_module_line(m)}")
-            if len(ranked3) > limit:
-                lines.append(f"... {len(ranked3) - limit} more hidden")
+    def append_matches(title, matches, limit, empty, no_project):
+        lines.extend([title, "-" * 80])
+        if not plugin_names:
+            lines.append(no_project)
+        elif matches:
+            lines.extend(f"{i:02}. {_format_project_match(item)}" for i, item in enumerate(matches[:limit], 1))
+            if len(matches) > limit:
+                lines.append(f"... {len(matches) - limit} more hidden")
         else:
             lines.append(empty)
         lines.append("")
 
-    lines.append("Loaded project FX present in dump")
-    lines.append("-" * 80)
+    append_matches("Project FX matched in EXCEPTION THREAD stack (strong evidence)", matches_exception, 25,
+                   "No opened .song FX matched inside exception-thread stack modules.",
+                   "Project context not loaded. Open a .song first to match dump modules against project FX.")
+    append_matches("Project FX matched in ALL THREAD stacks (supporting evidence)", matches_all, 35,
+                   "No opened .song FX matched in all-thread stack modules.", "Project context not loaded.")
+
+    lines += ["Loaded project FX present in dump", "-" * 80]
     if plugin_names:
         lines.append("Informational only: loaded module presence is NOT crash evidence.")
-        if loaded_only_project_matches:
-            lines.append(f"Loaded project FX/module matches: {len(loaded_only_project_matches)}")
-            lines.append("Hidden from main suspect list to avoid matching the whole project.")
+        if loaded_only:
+            lines.append(f"Loaded project FX/module matches: {len(loaded_only)}")
+            lines.append("Hidden from the main suspect list to avoid matching the whole project.")
         else:
             lines.append("No loaded project FX/module name matches.")
     else:
         lines.append("Project context not loaded.")
     lines.append("")
 
-    append_ranked(
-        "Top Exception Thread Non-System Modules",
-        exception_non_system,
-        20,
-        "No non-system modules found in exception thread stack.",
-        exception_thread=True,
-    )
+    def append_ranked(title, ranked, limit, empty, *, exception_thread=False):
+        lines.extend([title, "-" * 80])
+        ranked3 = _ranked_with_suspicion(ranked, exception_thread=exception_thread)
+        if ranked3:
+            lines.extend(f"{i:02}. rank={rank:3} hits={count:3}  {_format_module_line(m)}"
+                         for i, (m, count, rank) in enumerate(ranked3[:limit], 1))
+            if len(ranked3) > limit:
+                lines.append(f"... {len(ranked3) - limit} more hidden")
+        else:
+            lines.append(empty)
+        lines.append("")
 
-    append_ranked(
-        "Top Exception Thread Plugin-Path Modules",
-        exception_plugin,
-        15,
-        "No plugin-path modules found in exception thread stack.",
-        exception_thread=True,
-    )
+    append_ranked("Top Exception Thread Non-System Modules", exception_non_system, 20,
+                  "No non-system modules found in exception thread stack.", exception_thread=True)
+    append_ranked("Top Exception Thread Plugin-Path Modules", exception_plugin, 15,
+                  "No plugin-path modules found in exception thread stack.", exception_thread=True)
+    append_ranked("Top All-Thread Non-System Modules", all_non_system, 25,
+                  "No non-system modules found across saved thread stacks.")
+    append_ranked("Top All-Thread Plugin-Path Modules", all_plugin, 20,
+                  "No plugin-path modules found across saved thread stacks.")
 
-    append_ranked(
-        "Top All-Thread Non-System Modules",
-        all_non_system,
-        25,
-        "No non-system modules found across saved thread stacks.",
-    )
-
-    append_ranked(
-        "Top All-Thread Plugin-Path Modules",
-        all_plugin,
-        20,
-        "No plugin-path modules found across saved thread stacks.",
-    )
-
-    lines.append("Loaded Module Counts by Category")
-    lines.append("-" * 80)
-    categories = ["plugin-path", "host", "audio-driver", "licensing", "graphics", "non-system", "system/runtime", "system", "unknown"]
-    for cat in categories:
-        count = sum(1 for m in report.modules if classify_module(m.name) == cat)
-        if count:
-            lines.append(f"{cat:16} {count}")
-    lines.append("")
-
-    lines.append("Full evidence files")
-    lines.append("-" * 80)
-    lines.append("This compact report intentionally hides long raw lists and loaded-only project FX matches.")
-    lines.append("If needed, use *_pure_dump_report.txt / saved report file for the full evidence.")
+    lines += ["Loaded Module Counts by Category", "-" * 80]
+    counts: dict[str, int] = {}
+    for m in report.modules:
+        cat = classify_module(m.name)
+        counts[cat] = counts.get(cat, 0) + 1
+    for cat in ("plugin-path", "host", "audio-driver", "licensing", "graphics", "non-system", "system/runtime", "system", "unknown"):
+        if counts.get(cat):
+            lines.append(f"{cat:16} {counts[cat]}")
     lines.append("")
 
     return "\n".join(lines)

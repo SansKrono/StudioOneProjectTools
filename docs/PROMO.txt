@@ -1,0 +1,50 @@
+STUDIO ONE PROJECT TOOLS V2
+Beta Stable RC2
+
+Studio One Project Tools v2 is a cleanup, consolidation, recovery and diagnostics utility for
+Studio One / Fender Studio Pro projects.
+
+CORE IDEA
+The app creates a clean, self-contained copy of a project without overwriting the original .song
+file. The result is a project folder with the audio it needs, recovered missing files, an optional
+second .song without bypassed FX, and reports describing everything that was done.
+
+KEY FEATURES
+- Self-contained project copy that keeps the original folder structure.
+- Fast missing-audio search across all indexed drives through Everything / es.exe.
+- Recovery of found missing files into a new, relinked .song copy.
+- A separate .song copy with bypassed FX removed.
+- Plugin overview by track and FX slot.
+- Detection of unused and duplicate audio near the project.
+- Batch consolidation of many projects.
+- Crash Analyzer for minidumps and logs, with no debugger required.
+
+WHAT IT HELPS YOU CLEAN UP
+- bypassed plugins / FX;
+- unused audio files in the project folder;
+- duplicate side files;
+- scattered and missing audio references;
+- dependence on old external drives and random file paths.
+
+CONSOLIDATION
+The app creates a new project folder and copies the audio the project uses into it. Missing files
+can be found across indexed drives through Everything. The new .song is relinked so the project points
+at the copied files, and a post-check lists anything that is still broken.
+
+PLUGINS
+See every plugin by track and slot, spot bypassed FX, and write a copy of the .song without them.
+The original project is not overwritten.
+
+AUDIO / FILES
+See which files are referenced, missing, external, duplicated or unused.
+
+CRASH ANALYZER
+The built-in Crash Analyzer reads minidumps directly, scans thread stacks and helps identify what was
+most likely involved in a crash: a project FX, an audio driver, a licensing DLL, the host, a graphics
+DLL or another non-system module. The strongest evidence is highlighted.
+
+WHO IT IS FOR
+- producers, recording and mixing engineers;
+- Studio One / Fender Studio Pro users;
+- anyone moving projects between drives and computers;
+- anyone dealing with missing files, duplicates, bypassed FX, messy project folders or unexplained crashes.
